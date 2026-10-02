@@ -1,0 +1,525 @@
+#!/data/data/com.termux/files/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+import os, re, json, socket, time, subprocess, base64, yaml
+from urllib.parse import unquote, parse_qs
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+import threading
+
+# ======================================
+# PATHS
+# ======================================
+BASE_DIR = "/storage/emulated/0/Download/Akbar98"
+os.makedirs(BASE_DIR, exist_ok=True)
+INPUT_PATH = os.path.join(BASE_DIR, "input.txt")
+
+with open(INPUT_PATH, "w", encoding="utf-8") as f:
+    f.write("")
+subprocess.call(["nano", INPUT_PATH])
+
+out_folder = input("Enter output folder name in Download: ").strip()
+if not out_folder:
+    print("Folder name required."); exit(1)
+OUT_DIR = os.path.join("/storage/emulated/0/Download", out_folder)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+out_name = input("Enter output file name (without extension): ").strip()
+if not out_name:
+    print("File name required."); exit(1)
+OUT_PATH = os.path.join(OUT_DIR, f"{out_name}.yaml")
+# ======================================
+# PART 2A – PARSERS
+# ======================================
+
+def b64fix(s):
+    if not s: return ""
+    s = s.strip().replace(" ", "").replace("\n", "")
+    s = s.replace("-", "+").replace("_", "/")
+    return s + "=" * (-len(s) % 4)
+
+def safe_int(x, d=0):
+    try: return int(x)
+    except: return d
+
+def uniq_name(x):
+    base = re.sub(r"[^A-Za-z0-9_\- .\u0600-\u06FF]", "", x or "")
+    if not base: base = "Proxy"
+    i = 1; name = base
+    while name in uniq_name.used:
+        i += 1; name = f"{base}-{i}"
+    uniq_name.used.add(name)
+    return name
+uniq_name.used = set()
+
+def extract_parts(raw):
+    frag = ""
+    if "#" in raw:
+        raw, frag = raw.split("#", 1)
+        frag = unquote(frag)
+
+    if "?" in raw:
+        main, qs = raw.split("?", 1)
+        q = {k: v[0] if isinstance(v, list) else v for k, v in parse_qs(qs).items()}
+    else:
+        main, q = raw, {}
+
+    return main, q, frag
+
+def detect(line):
+    l = line.lower()
+    if l.startswith("vless://"): return "vless"
+    if l.startswith("vmess://"): return "vmess"
+    if l.startswith("trojan://"): return "trojan"
+    if l.startswith("ss://"): return "ss"
+    if l.startswith("hysteria2://"): return "hysteria2"
+    return None
+
+# ======================================
+# PART 2B – FULL PARSER FOR EACH PROTOCOL
+# ======================================
+
+def parse_vless(line):
+    try:
+        raw = line[8:]
+        main, q, frag = extract_parts(raw)
+        if "@" not in main: return None
+        uid, hostport = main.split("@", 1)
+        if ":" not in hostport: return None
+        host, port = hostport.split(":", 1)
+
+        p = {
+            "type": "vless",
+            "name": uniq_name(frag or f"VLESS-{host}"),
+            "server": host,
+            "port": safe_int(port),
+            "uuid": uid,
+            "udp": True,
+            "network": q.get("type", "tcp"),
+            "flow": q.get("flow", "")
+        }
+
+        sec = q.get("security", "")
+        if sec == "tls":
+            p["tls"] = True
+            p["sni"] = q.get("sni", host)
+
+        if p["network"] == "ws":
+            p["ws-opts"] = {"path": q.get("path", "/"), "headers": {"Host": q.get("host", host)}}
+        if p["network"] == "grpc":
+            p["grpc-opts"] = {"grpc-service-name": q.get("serviceName", "")}
+
+        return p
+    except:
+        return None
+
+def parse_vmess(line):
+    try:
+        raw = line[8:]
+        try: js = json.loads(base64.b64decode(b64fix(raw)).decode())
+        except: js = json.loads(unquote(raw))
+
+        host = js.get("add")
+        port = js.get("port")
+        uuid = js.get("id")
+        p = {
+            "type": "vmess",
+            "name": uniq_name(js.get("ps") or f"VMESS-{host}"),
+            "server": host,
+            "port": safe_int(port),
+            "uuid": uuid,
+            "alterId": safe_int(js.get("aid", 0)),
+            "cipher": js.get("scy", "auto"),
+            "udp": True,
+            "network": js.get("net", "tcp")
+        }
+        if p["network"] == "ws":
+            p["ws-opts"] = {"path": js.get("path", "/"), "headers": {"Host": js.get("host", host)}}
+        if js.get("tls") == "tls":
+            p["tls"] = True
+            p["sni"] = js.get("sni", host)
+        return p
+    except:
+        return None
+
+def parse_trojan(line):
+    try:
+        raw = line[9:]
+        main, q, frag = extract_parts(raw)
+        pwd, hostport = main.split("@", 1)
+        host, port = hostport.split(":", 1)
+        p = {"type": "trojan","name": uniq_name(frag or f"TROJAN-{host}"),"server": host,"port": safe_int(port),"password": pwd,"udp": True,"tls": True,"sni": q.get("sni", host)}
+        return p
+    except:
+        return None
+
+def parse_ss(line):
+    try:
+        raw = line[5:]
+        frag = ""
+        if "#" in raw: raw, frag = raw.split("#", 1); frag = unquote(frag)
+        if "@" not in raw:
+            dec = base64.b64decode(b64fix(raw)).decode()
+            creds, addr = dec.split("@", 1)
+            method, pwd = creds.split(":", 1)
+            host, port = addr.split(":", 1)
+        else:
+            creds, addr = raw.split("@", 1)
+            try: dec = base64.b64decode(b64fix(creds)).decode(); method, pwd = dec.split(":", 1)
+            except: method, pwd = creds.split(":", 1)
+            host, port = addr.split(":", 1)
+        return {"type": "ss","name": uniq_name(frag or f"SS-{host}"),"server": host,"port": safe_int(port),"cipher": method,"password": pwd,"udp": True}
+    except:
+        return None
+
+def parse_hysteria2(line):
+    try:
+        raw = line[len("hysteria2://"):]
+        main, q, frag = extract_parts(raw)
+        host, port = main.split(":")
+        return {"type": "hysteria2","name": uniq_name(frag or f"HYSTERIA2-{host}"),"server": host,"port": safe_int(port),"auth": q.get("auth", ""),"obfs": q.get("obfs", ""),"obfs-password": q.get("obfs-password", ""),"sni": q.get("sni", host),"udp": True}
+    except:
+        return None
+
+def parse_link(line):
+    proto = detect(line)
+    if proto == "vless": return parse_vless(line)
+    if proto == "vmess": return parse_vmess(line)
+    if proto == "trojan": return parse_trojan(line)
+    if proto == "ss": return parse_ss(line)
+    if proto == "hysteria2": return parse_hysteria2(line)
+    try: return json.loads(line)
+    except: return None
+
+def valid(p):
+    if not p or not p.get("server") or not p.get("port"): return False
+    t = p["type"]
+    if t in ("vless", "vmess") and not p.get("uuid"): return False
+    if t == "trojan" and not p.get("password"): return False
+    if t == "ss" and (not p.get("cipher") or not p.get("password")): return False
+    return True
+# ======================================
+# PART 3 – HELPERS & VALIDATION
+# ======================================
+
+def tcp_ping_ms(host, port, timeout=3.0):
+    """Ping ساده TCP و برگرداندن میلی‌ثانیه"""
+    start = time.time()
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return int((time.time() - start) * 1000)
+    except:
+        return None
+
+def check_proxy(proxy):
+    if not valid(proxy):
+        proxy["status"] = "dead"
+        proxy["ping"] = None
+        return proxy
+    lat = tcp_ping_ms(proxy["server"], proxy["port"])
+    if lat is None:
+        proxy["status"] = "dead"
+        proxy["ping"] = None
+    else:
+        proxy["status"] = "ok"
+        proxy["ping"] = lat
+    return proxy
+# ======================================
+# PART 4 – CONCURRENT PING
+# ======================================
+
+def ping_proxies(proxies):
+    results = []
+    if proxies:
+        max_workers = min(40, len(proxies))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = {ex.submit(check_proxy, p): p for p in proxies}
+            for fut in as_completed(futs):
+                try:
+                    res = fut.result()
+                    results.append(res)
+                except Exception:
+                    pass
+    return results
+
+def finalize_proxies(proxies, results):
+    name_map = {p["name"]: p for p in results} if results else {p["name"]: p for p in proxies}
+    final = [name_map.get(p["name"], p) for p in proxies]
+    return final
+
+def get_good_proxies(proxies):
+    return sorted([p for p in proxies if p.get("status") == "ok"], key=lambda x: x.get("ping", 99999))
+# ======================================
+# PART 5 – ATTACH PING & SORTING
+# ======================================
+
+def attach_ping_and_sort(proxies):
+    results = ping_proxies(proxies)
+    final_proxies = finalize_proxies(proxies, results)
+    good_sorted = get_good_proxies(final_proxies)
+    return final_proxies, good_sorted
+
+# نمونه استفاده
+with open(INPUT_PATH, "r", encoding="utf-8") as f:
+    lines = [l.strip() for l in f if l.strip()]
+
+proxies = []
+for line in lines:
+    p = parse_link(line)
+    if valid(p):
+        proxies.append(p)
+
+final_proxies, good_sorted = attach_ping_and_sort(proxies)
+# ======================================
+# PART 6 – GROUPS & SETTINGS
+# ======================================
+
+# نام گروه‌ها
+Select   = "Global ©️"
+Auto     = "Global - UrlTest(Tiers) 🥶"
+Stable   = "Global - Fallback(Tiers) 🌎"
+Fallback = "Global - LoadBalance(ch) 🦄"
+T1       = "Global - LoadBalance(rr) 🍄"
+T2       = "Tier 1 🚀"
+T3       = "Tier 2 ⚡️"
+T4       = "Tier 3 💎"
+T5       = "Tier 4 🗿"
+
+# رنج ping برای رنگ‌ها
+PING_RANGES = {
+    "green": (1, 500),
+    "yellow": (501, 1500),
+    "dead": (0, 0),
+    "too_high": (1501, 99999)
+}
+
+# تنظیمات گروه‌ها
+GROUP_SETTINGS = {
+    "Auto":      {"min_proxies": 35, "ping_color": "green", "interval": 25, "tolerance": 50, "timeout": 2},
+    "Stable":    {"min_proxies": 25, "ping_color": "green", "interval": 3,  "tolerance": 50, "timeout": 2},
+    "Fallback":  {"min_proxies": 33, "ping_color": "yellow","interval": 20, "tolerance": 50, "timeout": 3},
+    "T1":        {"min_proxies": 12, "ping_color": "green","interval": 1895,"tolerance": 50,"timeout": 2},
+    "T2":        {"min_proxies": 14, "ping_color": "yellow","interval": 300,"tolerance": 50,"timeout": 3},
+    "T3":        {"min_proxies": 8,  "ping_color": "yellow","interval": 29860,"tolerance": 50,"timeout": 33},
+    "T4":        {"min_proxies": 8,  "ping_color": "green","interval": 1000,"tolerance": 50,"timeout": 2}
+}
+
+def get_group_proxies(group_name, good_sorted):
+    settings = GROUP_SETTINGS.get(group_name, {})
+    min_proxies = settings.get("min_proxies", 1)
+    ping_color = settings.get("ping_color", "green")
+    ping_min, ping_max = PING_RANGES.get(ping_color, (1, 99999))
+
+    # انتخاب پروکسی‌های سالم در محدوده رنگی
+    candidates = [p for p in good_sorted if p.get("status")=="ok" and ping_min <= p.get("ping",0) <= ping_max]
+    candidates.sort(key=lambda x: x.get("ping",99999))
+
+    # اگر تعداد کافی نبود، از همه پروکسی‌های سالم استفاده شود
+    if len(candidates) < min_proxies:
+        backup = [p for p in good_sorted if p.get("status")=="ok"]
+        backup.sort(key=lambda x: x.get("ping",99999))
+        for p in backup:
+            if p not in candidates:
+                candidates.append(p)
+            if len(candidates) >= min_proxies:
+                break
+
+    return candidates[:min_proxies] if candidates else []
+
+# ساختار اولیه config
+config = {
+    "proxies": final_proxies,
+    "proxy-groups": [
+        {"name": Select, "type": "select", "proxies": [Auto, Fallback, Stable, T1, T2, T3, T4, "DIRECT"] + [p["name"] for p in final_proxies]},
+        {"name": Auto, "type": "url-test", "url": "http://clients3.google.com/generate_204", "interval": GROUP_SETTINGS["Auto"]["interval"], "tolerance": GROUP_SETTINGS["Auto"]["tolerance"], "proxies": [p["name"] for p in get_group_proxies("Auto", good_sorted)]},
+        {"name": Stable, "type": "fallback", "url": "http://clients3.google.com/generate_204", "interval": GROUP_SETTINGS["Stable"]["interval"], "proxies": [p["name"] for p in get_group_proxies("Stable", good_sorted)]},
+        {"name": Fallback, "type": "fallback", "url": "http://clients3.google.com/generate_204", "interval": GROUP_SETTINGS["Fallback"]["interval"], "timeout": GROUP_SETTINGS["Fallback"]["timeout"], "tolerance": GROUP_SETTINGS["Fallback"]["tolerance"], "proxies": [p["name"] for p in get_group_proxies("Fallback", good_sorted)]},
+        {"name": T1, "type": "url-test", "url": "http://clients3.google.com/generate_204", "interval": GROUP_SETTINGS["T1"]["interval"], "tolerance": GROUP_SETTINGS["T1"]["tolerance"], "proxies": [p["name"] for p in get_group_proxies("T1", good_sorted)]},
+        {"name": T2, "type": "fallback", "url": "http://clients3.google.com/generate_204", "interval": GROUP_SETTINGS["T2"]["interval"], "proxies": [p["name"] for p in get_group_proxies("T2", good_sorted)]},
+        {"name": T3, "type": "fallback", "url": "http://clients3.google.com/generate_204", "interval": GROUP_SETTINGS["T3"]["interval"], "timeout": GROUP_SETTINGS["T3"]["timeout"], "tolerance": GROUP_SETTINGS["T3"]["tolerance"], "proxies": [p["name"] for p in get_group_proxies("T3", good_sorted)]},
+        {"name": T4, "type": "url-test", "url": "http://clients3.google.com/generate_204", "interval": GROUP_SETTINGS["T4"]["interval"], "tolerance": GROUP_SETTINGS["T4"]["tolerance"], "proxies": [p["name"] for p in get_group_proxies("T4", good_sorted)]}
+    ],
+    "rules": [f"MATCH,{Select}"]
+}
+
+# ذخیره اولیه YAML
+with open(OUT_PATH, "w", encoding="utf-8") as f:
+    yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
+# ======================================
+# PART 7-8 – SMART SWITCHING & STABILITY
+# ======================================
+
+from collections import deque
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+# تنظیمات پایدارسازی
+MIN_STABLE_SCORE = 0.7    # حداقل Stability برای گروه Stable
+SWITCH_THRESHOLD = 0.15   # تغییر فقط اگر اختلاف score > 15%
+FAIL_PENALTY = 300        # امتیاز جریمه برای هر Fail
+MAX_HISTORY = 20          # تعداد آخرین پینگ‌ها برای History
+PING_TIMEOUT = 1500       # اگر پینگ بالاتر از این باشد Fail محسوب می‌شود
+
+class ProxyNode:
+    def __init__(self, data):
+        self.data = data
+        self.name = data.get("name", "")
+        self.server = data.get("server", "")
+        self.port = data.get("port", 0)
+        self.history = deque(maxlen=MAX_HISTORY)
+        self.fail_count = 0
+        self.alive = True
+        self.score = 0.0
+
+    def update(self, ping):
+        if ping is None or ping > PING_TIMEOUT:
+            self.fail_count += 1
+            self.history.append(FAIL_PENALTY)
+            self.alive = False
+        else:
+            self.fail_count = max(0, self.fail_count - 1)
+            self.history.append(ping)
+            self.alive = True
+
+    def avg_latency(self):
+        if not self.history:
+            return 1000
+        vals = [v for v in self.history if v < 10000]
+        return sum(vals)/len(vals) if vals else 1000
+
+    def stability(self):
+        if not self.history:
+            return 0.0
+        good = sum(1 for x in self.history if x < PING_TIMEOUT)
+        return good / len(self.history)
+
+    def compute_score(self):
+        latency = self.avg_latency()
+        stability = self.stability()
+        penalty = self.fail_count * FAIL_PENALTY
+        if stability < MIN_STABLE_SCORE:
+            penalty += 10000  # ناپایدارها شدیداً جریمه می‌شوند
+        self.score = (latency * (1.0 / max(stability, 0.01))) + penalty
+        return self.score
+
+class AutoSwitch:
+    def __init__(self, nodes):
+        self.nodes = [ProxyNode(n) for n in nodes]
+        self.current = None
+
+    def ping_all(self):
+        def tcp_ping_wrapper(node):
+            try:
+                # فرض: تابع tcp_ping(host, port) تعریف شده
+                return tcp_ping(node.server, node.port)
+            except Exception:
+                return None
+
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            futures = {ex.submit(tcp_ping_wrapper, n): n for n in self.nodes}
+            for f in futures:
+                n = futures[f]
+                n.update(f.result())
+
+    def choose(self):
+        stable_nodes = [n for n in self.nodes if n.stability() >= MIN_STABLE_SCORE and n.alive]
+        stable_nodes.sort(key=lambda x: x.compute_score())
+
+        if not stable_nodes:
+            return None
+
+        best = stable_nodes[0]
+
+        if self.current is None:
+            self.current = best
+            return best
+
+        # هیسترزیس واقعی (Anti-Flap)
+        diff = (self.current.score - best.score) / max(self.current.score, 1)
+        if diff > SWITCH_THRESHOLD:
+            self.current = best
+        return self.current
+
+    def loop(self, interval=10):
+        while True:
+            self.ping_all()
+            active = self.choose()
+            if active:
+                print(f"[⚡] Active Proxy → {active.name} ({active.avg_latency():.1f} ms, stability {active.stability():.2f})")
+            time.sleep(interval)
+
+# =======================
+# نحوه استفاده
+# =======================
+# autoswitch = AutoSwitch(good_sorted)
+# autoswitch.loop(interval=5)
+# ======================================
+# PART 9-10 – GROUPS & FINAL CONFIG
+# ======================================
+
+import yaml
+import os
+
+# تعریف گروه‌ها
+Select  = "Global ©️"
+Auto    = "Global - UrlTest(Tiers) 🥶"
+Stable  = "Global - Fallback(Tiers) 🌎"
+Fallback= "Global - LoadBalance(ch) 🦄"
+T1      = "Global - LoadBalance(rr) 🍄"
+T2      = "Tier 1 🚀"
+T3      = "Tier 2 ⚡️"
+T4      = "Tier 3 💎"
+T5      = "Tier 4 🗿"
+
+# تنظیمات گروه‌ها
+GROUP_SETTINGS = {
+    "Auto": {"min_proxies": 35, "ping_color": "green", "interval": 25, "tolerance": 50, "timeout": 2},
+    "Stable": {"min_proxies": 25, "ping_color": "green", "interval": 3, "tolerance": 50, "timeout": 2},
+    "Fallback": {"min_proxies": 33, "ping_color": "yellow", "interval": 20, "tolerance": 50, "timeout": 3},
+    "T1": {"min_proxies": 12, "ping_color": "green", "interval": 1895, "tolerance": 50, "timeout": 2},
+    "T2": {"min_proxies": 14, "ping_color": "yellow", "interval": 300, "tolerance": 50, "timeout": 3},
+    "T3": {"min_proxies": 8, "ping_color": "yellow", "interval": 29860, "tolerance": 50, "timeout": 33},
+    "T4": {"min_proxies": 8, "ping_color": "green", "interval": 1000, "tolerance": 50, "timeout": 2}
+}
+
+PING_RANGES = {
+    "green": (1, 500),
+    "yellow": (501, 1500)
+}
+
+def get_group_proxies(group_name, proxies):
+    settings = GROUP_SETTINGS.get(group_name, {})
+    min_proxies = settings.get("min_proxies", 1)
+    ping_color = settings.get("ping_color", "green")
+    ping_min, ping_max = PING_RANGES.get(ping_color, (1, 99999))
+
+    # فقط پروکسی‌های alive و با ping مناسب
+    candidates = [p for p in proxies if p.alive and ping_min <= p.avg_latency() <= ping_max and p.stability() >= MIN_STABLE_SCORE]
+    candidates.sort(key=lambda x: x.avg_latency())
+    return candidates[:min_proxies] if candidates else []
+
+# ساخت config نهایی
+def build_final_config(nodes, out_path):
+    config = {
+        "proxies": [n.data for n in nodes],
+        "proxy-groups": [
+            {"name": Select, "type": "select", "proxies": [Auto, Stable, Fallback, T1, T2, T3, T4, "DIRECT"] + [n.name for n in nodes]},
+            {"name": Auto, "type": "url-test", "url": "http://clients3.google.com/generate_204", "interval": GROUP_SETTINGS["Auto"]["interval"], "tolerance": GROUP_SETTINGS["Auto"]["tolerance"], "proxies": [n.name for n in get_group_proxies("Auto", nodes)]},
+            {"name": Stable, "type": "fallback", "url": "http://clients3.google.com/generate_204", "interval": GROUP_SETTINGS["Stable"]["interval"], "proxies": [n.name for n in get_group_proxies("Stable", nodes)]},
+            {"name": Fallback, "type": "fallback", "url": "http://clients3.google.com/generate_204", "interval": GROUP_SETTINGS["Fallback"]["interval"], "timeout": GROUP_SETTINGS["Fallback"]["timeout"], "tolerance": GROUP_SETTINGS["Fallback"]["tolerance"], "proxies": [n.name for n in get_group_proxies("Fallback", nodes)]},
+            {"name": T1, "type": "url-test", "url": "http://clients3.google.com/generate_204", "interval": GROUP_SETTINGS["T1"]["interval"], "tolerance": GROUP_SETTINGS["T1"]["tolerance"], "proxies": [n.name for n in get_group_proxies("T1", nodes)]},
+            {"name": T2, "type": "fallback", "url": "http://clients3.google.com/generate_204", "interval": GROUP_SETTINGS["T2"]["interval"], "proxies": [n.name for n in get_group_proxies("T2", nodes)]},
+            {"name": T3, "type": "fallback", "url": "http://clients3.google.com/generate_204", "interval": GROUP_SETTINGS["T3"]["interval"], "timeout": GROUP_SETTINGS["T3"]["timeout"], "tolerance": GROUP_SETTINGS["T3"]["tolerance"], "proxies": [n.name for n in get_group_proxies("T3", nodes)]},
+            {"name": T4, "type": "url-test", "url": "http://clients3.google.com/generate_204", "interval": GROUP_SETTINGS["T4"]["interval"], "tolerance": GROUP_SETTINGS["T4"]["tolerance"], "proxies": [n.name for n in get_group_proxies("T4", nodes)]}
+        ],
+        "rules": [f"MATCH,{Select}"]
+    }
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
+
+    print(f"[✅] Config saved to {out_path} with {len(nodes)} proxies")
+
+# نمونه اجرا
+# build_final_config(autoswitch.nodes, "/storage/emulated/0/Download/final_config.yaml")

@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+import os
+import json
+import base64
+import subprocess
+import requests
+
+# ================== مسیرها ==================
+BASE_DIR = "/storage/emulated/0/Download/input.txt"  # مسیر ورودی جهت خواندن فایل‌ها
+OUTPUT_DIR = "/storage/emulated/0/Download/v2ray_output"  # مسیر خروجی جهت ذخیره محتوا
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ================== HELPERS ==================
+def b64e(s: str) -> str:
+    """تبدیل رشته به Base64"""
+    return base64.b64encode(s.encode()).decode()
+
+def fix_vmess(link):
+    """تبدیل لینک vmess به Base64"""
+    try:
+        raw = link.replace("vmess://", "")
+        j = json.loads(base64.b64decode(raw + "===").decode())
+        clean = json.dumps(j, separators=(",", ":"))
+        return "vmess://" + b64e(clean)
+    except Exception as e:
+        return None
+
+def fix_ss(link):
+    """تبدیل لینک ss به Base64"""
+    try:
+        raw = link.replace("ss://", "").split("#")[0]
+        base64.b64decode(raw + "===")
+        return "ss://" + raw
+    except Exception as e:
+        try:
+            return "ss://" + b64e(raw)
+        except Exception as e:
+            return None
+
+def normalize(line):
+    """تبدیل خطوط پروتکل‌ها به Base64"""
+    line = line.strip()
+    if not line:
+        return None
+
+    if line.startswith("vmess://"):
+        return fix_vmess(line)
+    if line.startswith("ss://"):
+        return fix_ss(line)
+    if line.startswith((
+        "vless://", "trojan://", "hysteria://", "hysteria2://",
+        "tuic://", "socks://", "http://", "https://"
+    )):
+        return line
+    return None
+
+# ================== بارگذاری و پردازش لینک‌ها ==================
+def process_link_from_url(url, idx):
+    try:
+        # دریافت محتویات لینک ساب
+        response = requests.get(url)
+        response.raise_for_status()  # اگر خطا باشه، ارور میده
+        content = response.text
+    except Exception as e:
+        print(f"[Error] Failed to retrieve content from {url}: {e}")
+        return
+
+    # پردازش هر خط از محتوای لینک
+    all_configs = []
+    for line in content.splitlines():
+        processed_line = normalize(line)
+        if processed_line:
+            all_configs.append(processed_line)
+
+    # ================== ذخیره خروجی به فایل ==================
+    if all_configs:
+        output_file = os.path.join(OUTPUT_DIR, f"output_{idx}.txt")
+        subscription_raw = "\n".join(all_configs)
+        subscription_b64 = base64.b64encode(subscription_raw.encode()).decode()
+
+        with open(output_file, "w", encoding="utf-8") as base_file:
+            base_file.write(subscription_b64)
+
+        print(f"[✓] Processed and saved to: {output_file}")
+    else:
+        print(f"[Error] No valid content found in {url}")
+
+# ================== باز کردن نانو برای وارد کردن لینک‌ها ==================
+def open_nano_for_input():
+    # بررسی و ایجاد فایل ورودی `input.txt` اگر وجود نداشته باشد
+    if not os.path.exists(BASE_DIR):
+        with open(BASE_DIR, "w", encoding="utf-8") as file:
+            pass  # اگر فایل وجود نداشت، آن را می‌سازیم
+
+    try:
+        # باز کردن فایل در ویرایشگر nano
+        subprocess.call(["nano", BASE_DIR])
+    except Exception as e:
+        print(f"[Error] Failed to open nano: {e}")
+
+# ================== خواندن لینک‌ها از فایل ورودی ==================
+def get_links_from_input():
+    # خواندن ساب‌لینک‌ها از فایل ورودی
+    links = []
+    try:
+        with open(BASE_DIR, "r", encoding="utf-8") as file:
+            links = file.readlines()
+    except Exception as e:
+        print(f"[Error] Failed to read input file: {e}")
+    
+    return [link.strip() for link in links if link.strip()]
+
+# ================== پاک کردن محتویات فایل ورودی ==================
+def reset_input_file():
+    with open(BASE_DIR, "w", encoding="utf-8") as file:
+        file.write("")  # نوشتن رشته خالی برای پاک کردن محتویات
+
+# ================== اجرای پردازش ==================
+if __name__ == "__main__":
+    # باز کردن نانو برای وارد کردن ساب‌لینک‌ها
+    open_nano_for_input()
+
+    # خواندن لینک‌ها از فایل ورودی
+    links = get_links_from_input()
+
+    # پردازش هر ساب‌لینک
+    for idx, link in enumerate(links, start=1):
+        process_link_from_url(link, idx)
+
+    # پاک کردن فایل ورودی پس از پردازش
+    reset_input_file()

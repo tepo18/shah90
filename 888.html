@@ -1,0 +1,385 @@
+#!/data/data/com.termux/files/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+"""
+ULTRA INDUSTRIAL CLASH META ENGINE
+Cleaned • Stable • No Logic Removed
+"""
+
+# ====================== IMPORTS (DEDUPED & ORDERED) ======================
+import os
+import sys
+import re
+import time
+import json
+import yaml
+import base64
+import socket
+import threading
+import subprocess
+import logging
+
+from collections import deque, defaultdict
+from urllib.parse import urlparse, parse_qs, unquote
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ====================== FIXED PATHS (AS REQUESTED) ======================
+BASE_DIR = "/storage/emulated/0/Download/Akbar98"
+os.makedirs(BASE_DIR, exist_ok=True)
+
+INPUT_PATH = os.path.join(BASE_DIR, "input.txt")
+with open(INPUT_PATH, "w", encoding="utf-8") as f:
+    f.write("")
+
+subprocess.call(["nano", INPUT_PATH])
+
+out_folder = input("Enter output folder name in Download: ").strip()
+if not out_folder:
+    print("Folder name required.")
+    sys.exit(1)
+
+OUT_DIR = os.path.join("/storage/emulated/0/Download", out_folder)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+out_name = input("Enter output file name (without extension): ").strip()
+if not out_name:
+    print("File name required.")
+    sys.exit(1)
+
+OUT_PATH = os.path.join(OUT_DIR, f"{out_name}.yaml")
+
+# ====================== LOGGER ======================
+logger = logging.getLogger("UltraClash")
+logger.setLevel(logging.DEBUG)
+
+fh = logging.FileHandler(os.path.join(BASE_DIR, "engine.log"), encoding="utf-8")
+sh = logging.StreamHandler(sys.stdout)
+
+fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+fh.setFormatter(fmt)
+sh.setFormatter(fmt)
+
+logger.addHandler(fh)
+logger.addHandler(sh)
+
+# ====================== CONSTANTS ======================
+MAX_HISTORY = 20
+PING_TIMEOUT = 0.7
+PING_ATTEMPTS = 5
+MAX_WORKERS = 40
+
+MIN_STABLE_SCORE = 0.6
+SWITCH_THRESHOLD = 0.15
+
+# ====================== UTILS ======================
+def safe_int(v, default=0):
+    try:
+        return int(v)
+    except Exception:
+        try:
+            return int(float(v))
+        except Exception:
+            return default
+
+
+def b64fix(s: str) -> str:
+    if not s:
+        return ""
+    s = str(s).strip().replace("\n", "").replace(" ", "")
+    s = s.replace("-", "+").replace("_", "/")
+    return s + "=" * (-len(s) % 4)
+
+
+def is_probably_base64(s: str) -> bool:
+    try:
+        base64.b64decode(b64fix(s))
+        return True
+    except Exception:
+        return False
+
+
+def sanitize(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_\- .]", "", str(text)).strip()
+
+
+_USED_NAMES = set()
+def uniq_name(base: str) -> str:
+    base = sanitize(base) or "Proxy"
+    name = base
+    i = 2
+    while name in _USED_NAMES:
+        name = f"{base} {i}"
+        i += 1
+    _USED_NAMES.add(name)
+    return name
+
+
+def tail(value, n=6):
+    if not value:
+        return ""
+    v = re.sub(r"[-]", "", str(value))
+    return v[-n:] if len(v) >= n else v
+# ====================== PROXY PARSERS ======================
+
+def parse_vless(line):
+    try:
+        raw = line[8:]
+        frag = ""
+        if "#" in raw:
+            raw, frag = raw.split("#", 1)
+            frag = unquote(frag)
+
+        main, _, qs = raw.partition("?")
+        uid, hostport = main.split("@", 1)
+        host, _, port = hostport.partition(":")
+        q = dict(x.split("=", 1) for x in qs.split("&") if "=" in x)
+
+        p = {
+            "name": uniq_name(frag or f"vless-{host}-{tail(uid)}"),
+            "type": "vless",
+            "server": host,
+            "port": safe_int(port or 443),
+            "uuid": uid,
+            "encryption": q.get("encryption", "none"),
+            "network": q.get("type", "tcp"),
+            "udp": True
+        }
+
+        if q.get("security") == "tls":
+            p["tls"] = True
+            p["servername"] = q.get("sni", host)
+
+        if p["network"] == "ws":
+            p["ws-opts"] = {"path": q.get("path", "/")}
+            if q.get("host"):
+                p["ws-opts"]["headers"] = {"Host": q["host"]}
+
+        if p["network"] == "grpc":
+            p["grpc-opts"] = {"grpc-service-name": q.get("serviceName", "")}
+
+        return p
+    except Exception:
+        return None
+
+
+def parse_vmess(line):
+    try:
+        raw = base64.b64decode(b64fix(line[8:])).decode()
+        js = json.loads(raw)
+
+        p = {
+            "name": uniq_name(js.get("ps", "vmess")),
+            "type": "vmess",
+            "server": js["add"],
+            "port": safe_int(js["port"]),
+            "uuid": js["id"],
+            "alterId": safe_int(js.get("aid", 0)),
+            "cipher": js.get("scy", "auto"),
+            "network": js.get("net", "tcp"),
+            "udp": True
+        }
+
+        if js.get("tls") == "tls":
+            p["tls"] = True
+            p["servername"] = js.get("sni", p["server"])
+
+        if p["network"] == "ws":
+            p["ws-opts"] = {
+                "path": js.get("path", "/"),
+                "headers": {"Host": js.get("host", "")}
+            }
+
+        if p["network"] == "grpc":
+            p["grpc-opts"] = {"grpc-service-name": js.get("serviceName", "")}
+
+        return p
+    except Exception:
+        return None
+
+
+def parse_trojan(line):
+    try:
+        u = urlparse(line)
+        return {
+            "name": uniq_name(u.fragment or f"trojan-{u.hostname}"),
+            "type": "trojan",
+            "server": u.hostname,
+            "port": u.port or 443,
+            "password": u.username,
+            "udp": True
+        }
+    except Exception:
+        return None
+
+
+def parse_ss(line):
+    try:
+        body = line[5:]
+        frag = ""
+        if "#" in body:
+            body, frag = body.split("#", 1)
+
+        if "@" in body:
+            creds, addr = body.split("@", 1)
+            decoded = base64.b64decode(b64fix(creds)).decode()
+            method, pwd = decoded.split(":", 1)
+            host, port = addr.split(":")
+        else:
+            decoded = base64.b64decode(b64fix(body)).decode()
+            creds, addr = decoded.split("@")
+            method, pwd = creds.split(":")
+            host, port = addr.split(":")
+
+        return {
+            "name": uniq_name(frag or f"ss-{host}"),
+            "type": "ss",
+            "server": host,
+            "port": safe_int(port),
+            "cipher": method,
+            "password": pwd,
+            "udp": True
+        }
+    except Exception:
+        return None
+
+
+def parse_ssr(line):
+    try:
+        decoded = base64.b64decode(b64fix(line[6:])).decode()
+        main, _, _ = decoded.partition("/?")
+        server, port, proto, method, obfs, pwd = main.split(":")
+        pwd = base64.b64decode(b64fix(pwd)).decode()
+
+        return {
+            "name": uniq_name(f"ssr-{server}"),
+            "type": "ssr",
+            "server": server,
+            "port": safe_int(port),
+            "cipher": method,
+            "password": pwd,
+            "protocol": proto,
+            "obfs": obfs,
+            "udp": True
+        }
+    except Exception:
+        return None
+# ====================== PING ENGINE ======================
+
+def tcp_ping_once(host, port, timeout=PING_TIMEOUT):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        t = time.time()
+        s.connect((host, port))
+        s.close()
+        return int((time.time() - t) * 1000)
+    except Exception:
+        return None
+
+
+def tcp_ping(host, port):
+    results = []
+    for _ in range(PING_ATTEMPTS):
+        r = tcp_ping_once(host, port)
+        if r is not None:
+            results.append(r)
+    if not results:
+        return None
+    results.sort()
+    return results[len(results) // 2]
+
+
+class ProxyNode:
+    def __init__(self, data):
+        self.data = data
+        self.server = data["server"]
+        self.port = data["port"]
+        self.history = deque(maxlen=MAX_HISTORY)
+        self.fail = 0
+        self.score = 0
+
+    def update(self, ping):
+        if ping is None:
+            self.fail += 1
+            self.history.append(2000)
+        else:
+            self.fail = max(0, self.fail - 1)
+            self.history.append(ping)
+
+    def stability(self):
+        if not self.history:
+            return 0
+        good = sum(1 for x in self.history if x < 800)
+        return good / len(self.history)
+
+    def compute(self):
+        avg = sum(self.history) / len(self.history)
+        self.score = avg * (1 / max(self.stability(), 0.1)) + self.fail * 500
+        return self.score
+
+
+def parse_line_any(line):
+    l = line.lower()
+    if l.startswith("vless://"): return parse_vless(line)
+    if l.startswith("vmess://"): return parse_vmess(line)
+    if l.startswith("trojan://"): return parse_trojan(line)
+    if l.startswith("ss://"): return parse_ss(line)
+    if l.startswith("ssr://"): return parse_ssr(line)
+    return None
+
+
+def parse_text_all(text):
+    proxies = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if is_probably_base64(line):
+            try:
+                decoded = base64.b64decode(b64fix(line)).decode()
+                proxies.extend(parse_text_all(decoded))
+                continue
+            except Exception:
+                pass
+        p = parse_line_any(line)
+        if p:
+            proxies.append(p)
+    return proxies
+
+
+def build_clash_config(proxies):
+    names = [p["name"] for p in proxies]
+    return {
+        "proxies": proxies,
+        "proxy-groups": [
+            {"name": "🔰 Selector", "type": "select", "proxies": names},
+            {"name": "💎 Stable", "type": "fallback", "url": "https://www.gstatic.com/generate_204", "interval": 30, "proxies": names},
+            {"name": "⚡ Fast", "type": "url-test", "url": "https://www.gstatic.com/generate_204", "interval": 20, "tolerance": 50, "proxies": names},
+        ],
+        "rules": ["MATCH,🔰 Selector"]
+    }
+
+
+# ====================== MAIN ======================
+if __name__ == "__main__":
+    with open(INPUT_PATH, "r", encoding="utf-8") as f:
+        raw = f.read()
+
+    proxies = parse_text_all(raw)
+    nodes = [ProxyNode(p) for p in proxies]
+
+    for _ in range(3):
+        with ThreadPoolExecutor(MAX_WORKERS) as ex:
+            futures = {ex.submit(tcp_ping, n.server, n.port): n for n in nodes}
+            for f in futures:
+                futures[f].update(f.result())
+        time.sleep(1)
+
+    nodes.sort(key=lambda x: x.compute())
+    config = build_clash_config([n.data for n in nodes])
+
+    with open(OUT_PATH, "w", encoding="utf-8") as f:
+        yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
+
+    print("✅ DONE →", OUT_PATH)
+

@@ -1,0 +1,142 @@
+# ====================== MAIN PROCESS =========================
+
+
+def live_autoswitch(proxies):
+    ok = [p for p in proxies if p["status"] == "ok"]
+    ok.sort(key=lambda x: x["ping"] if x["ping"] else 9999)
+    fast3 = ok[:3]
+def live_autoswitch(proxies):
+    ok = [p for p in proxies if p["status"] == "ok"]
+    ok.sort(key=lambda x: x["ping"] if x["ping"] else 9999)
+    fast3 = ok[:3]
+
+    groups = [
+        {
+            "name": "🔰 Select",
+            "type": "select",
+            "proxies": [p["name"] for p in ok]
+        },
+        {
+            "name": "⚡ UltraFast",
+            "type": "fallback",
+            "proxies": [p["name"] for p in ok],
+            "url": "http://cp.cloudflare.com/generate_204",
+            "interval": 3
+        },
+        {
+            "name": "💎 Stable",
+            "type": "fallback",
+            "proxies": [p["name"] for p in ok],
+            "url": "http://cp.cloudflare.com/generate_204",
+            "interval": 2
+        },
+        {
+            "name": "🏆 BestPing",
+            "type": "fallback",
+            "proxies": [p["name"] for p in ok],
+            "url": "http://cp.cloudflare.com/generate_204",
+            "interval": 1
+        },
+        {
+            "name": "🛡Global3",
+            "type": "fallback",
+            "proxies": [p["name"] for p in ok],
+             "url": "http://cp.cloudflare.com/generate_204",
+            "interval": 300
+        },
+        {
+            "name": "⚡ Ultra Fastest",
+            "type": "fallback",
+            "proxies": [p["name"] for p in ok],
+            "url": "http://cp.cloudflare.com/generate_204",
+            "interval": 3
+        },
+        {
+            "name": "🌟Stable Fallback",
+            "type": "fallback",
+            "proxies": [p["name"] for p in ok],
+            "url": "http://cp.cloudflare.com/generate_204",
+            "interval": 2
+        },
+        {
+            "name": "🌐 All Proxies",
+            "type": "fallback",
+            "proxies": [p["name"] for p in ok],
+            "url": "http://cp.cloudflare.com/generate_204",
+            "interval": 1
+        }
+    ]
+
+    return {
+        "proxies": ok,
+        "proxy-groups": groups
+    }
+    
+    # ---------------- Main ----------------
+if __name__=="__main__":
+    import threading
+    lines=open(INPUT_PATH,"r",encoding="utf-8").read().splitlines()
+    raw_proxies=[p for ln in lines if (p:=parse_any(ln))]
+
+    def update_loop():
+        while True:
+            with ThreadPoolExecutor(max_workers=30) as exe:
+                final=list(exe.map(attach_ping, raw_proxies))
+            data=live_autoswitch(final)
+            with open(OUT_PATH,"w",encoding="utf-8") as f: yaml.dump(data,f,allow_unicode=True)
+            print(f"[Ultra Rapid] YAML updated at {time.strftime('%H:%M:%S')}")
+            time.sleep(2)
+
+    threading.Thread(target=update_loop, daemon=True).start()
+    print(f"\n✅ Ultra Live Rapid AutoSwitch running. Output: {OUT_PATH}")
+    print("Press Ctrl-C to stop live updates.")
+    try: 
+        while True: time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
+
+
+
+
+
+🪀به url  بسیار پایداری بستگی داره ادرس اینترنتی 
+
+🪀درحالت فالبک  حتما قرار داده بشه و نه روی  urlتست 
+
+🪀ترلانس 50 100  اون یکی  1 تا20
+
+🪀 نکته مهم جهت  عدم  ارور قسمت کمکی مهم 
+
+
+
+def live_autoswitch(proxies):
+    ok = [p for p in proxies if p["status"] == "ok"]
+    ok.sort(key=lambda x: x["ping"] if x["ping"] else 9999)
+    fast3 = ok[:3]
+
+
+این   مهم   برای  ابتدا   گروه ها  
+
+
+     "proxies": [p["name"] for p in ok],
+
+
+مهم برای هر گروه که حالت فالبک باشه 
+
+
+ 
+کمکی هم میفرستم 
+
+بسیار لازم 
+
+
+def attach_ping(proxy):
+    proxy["ping"]=tcp_ping_median(proxy["server"],proxy["port"])
+    proxy["status"]="ok" if proxy["ping"] is not None else "fail"
+    return proxy
+
+
+مهم برای عدم ارور اخر  سویچینگ  و  main 
+
+چون تعریف شده قبلا 
+

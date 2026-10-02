@@ -1,0 +1,298 @@
+#!/data/data/com.termux/files/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""
+Ultra Industrial Clash Meta Parser + Smart AutoSwitch
+Fully optimized, high stability, multi-protocol, Android compatible
+"""
+import os, sys, re, json, base64, socket, time, threading, yaml
+from urllib.parse import urlparse, parse_qs, unquote
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ---------------- Paths ----------------
+BASE_DIR = "/storage/emulated/0/Download/AkbarUltra"
+os.makedirs(BASE_DIR, exist_ok=True)
+INPUT_PATH = os.path.join(BASE_DIR, "input.txt")
+with open(INPUT_PATH, "w", encoding="utf-8") as f: f.write("")
+os.system(f"nano {INPUT_PATH}")
+
+out_folder = input("Enter output folder name in Download: ").strip()
+if not out_folder: print("Folder name required."); exit(1)
+OUT_DIR = os.path.join("/storage/emulated/0/Download", out_folder)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+out_name = input("Enter output file name (without extension): ").strip()
+if not out_name: print("File name required."); exit(1)
+OUT_PATH = os.path.join(OUT_DIR, f"{out_name}.yaml")
+
+# ---------------- Helpers ----------------
+def b64fix(s):
+    if not s: return ""
+    s = str(s).strip().replace("\n","").replace(" ","").replace("-", "+").replace("_","/")
+    pad = len(s)%4
+    if pad: s += "="*(4-pad)
+    return s
+
+def is_probably_base64(s):
+    if not isinstance(s,str): return False
+    s = s.strip()
+    if len(s)<8: return False
+    try: base64.b64decode(b64fix(s)); return True
+    except: return False
+
+def safe_int(v, default=0):
+    try: return int(v)
+    except: 
+        try: return int(float(v))
+        except: return default
+
+def sanitize(s):
+    if not s: return ""
+    return re.sub(r"[^A-Za-z0-9_\- .]", "", str(s)).strip()
+
+_used_names=set()
+def uniq_name(base):
+    base = sanitize(str(base)) or "Proxy"
+    name = base; i=2
+    while name in _used_names:
+        name = f"{base} {i}"; i+=1
+    _used_names.add(name)
+    return name
+
+def tail(s,n=6):
+    if not s: return ""
+    s2 = re.sub(r"[-]","",str(s))
+    return s2[-n:] if len(s2)>=n else s2
+
+# ---------------- TCP Ping ----------------
+def tcp_ping_once(host,port,timeout=0.7):
+    try:
+        s = socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        t1=time.time()
+        s.connect((host,port))
+        s.close()
+        return int((time.time()-t1)*1000)
+    except: return None
+
+def tcp_ping(host,port):
+    vals=[tcp_ping_once(host,port) for _ in range(3)]
+    vals=[v for v in vals if v is not None]
+    if not vals: return None
+    vals.sort()
+    return vals[len(vals)//2]
+
+# ---------------- ProxyNode for Smart AutoSwitch ----------------
+MIN_STABLE_SCORE=0.7
+SWITCH_THRESHOLD=0.15
+FAIL_PENALTY=300
+MAX_HISTORY=20
+
+class ProxyNode:
+    def __init__(self, data):
+        self.data=data
+        self.name=data["name"]
+        self.server=data["server"]
+        self.port=data["port"]
+        self.history=deque(maxlen=MAX_HISTORY)
+        self.fail_count=0
+        self.alive=True
+        self.score=0.0
+
+    def update(self,ping):
+        if ping is None:
+            self.fail_count+=1
+            self.history.append(FAIL_PENALTY)
+            self.alive=False
+        else:
+            self.fail_count=max(0,self.fail_count-1)
+            self.history.append(ping)
+            self.alive=True
+
+    def avg_latency(self):
+        if not self.history: return 1000
+        vals=[v for v in self.history if v<10000]
+        return sum(vals)/len(vals) if vals else 1000
+
+    def stability(self):
+        if not self.history: return 0.0
+        good=sum(1 for x in self.history if x<1000)
+        return good/len(self.history)
+
+    def compute_score(self):
+        latency=self.avg_latency()
+        stability=self.stability()
+        penalty=self.fail_count*FAIL_PENALTY
+        if stability<MIN_STABLE_SCORE: penalty+=10000
+        self.score=(latency*(1.0/max(stability,0.01)))+penalty
+        return self.score
+
+class AutoSwitch:
+    def __init__(self,nodes):
+        self.nodes=[ProxyNode(p) for p in nodes]
+        self.current=None
+
+    def ping_all(self):
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            futures={ex.submit(tcp_ping,n.server,n.port):n for n in self.nodes}
+            for f in as_completed(futures):
+                n=futures[f]
+                n.update(f.result())
+
+    def choose(self):
+        stable=[n for n in self.nodes if n.stability()>=MIN_STABLE_SCORE and n.alive]
+        stable.sort(key=lambda x:x.compute_score())
+        if not stable: return None
+        best=stable[0]
+        if self.current is None:
+            self.current=best
+            return best
+        diff=(self.current.score-best.score)/max(self.current.score,1)
+        if diff>SWITCH_THRESHOLD:
+            self.current=best
+        return self.current
+
+    def loop(self,interval=10):
+        while True:
+            self.ping_all()
+            active=self.choose()
+            if active:
+                print(f"[⚡] Active Proxy → {active.name} ({active.avg_latency():.1f} ms, stability {active.stability():.2f})")
+            time.sleep(interval)
+
+# ---------------- Parsing Functions ----------------
+# (شامل VLESS, VMESS, Trojan, SS, SSR, Hysteria, TUIC, WireGuard, QUIC, gRPC, HTTP/SOCKS)
+# نمونه برای brevity یک نمونه VLESS/VMESS/Trojan آورده شده، مشابه برای بقیه اضافه شود
+
+def parse_vless(line):
+    try:
+        parsed=urlparse(line)
+        raw=line[8:]
+        frag=""
+        if "#" in raw: raw,frag=raw.split("#",1); frag=unquote(frag)
+        if "?" in raw: main,qs=raw.split("?",1)
+        else: main,qs=raw,""
+        if "@" not in main: return None
+        uid,rest=main.split("@",1)
+        host,port=rest.split(":") if ":" in rest else (rest,"443")
+        q=dict(x.split("=",1) for x in qs.split("&") if "=" in qs) if qs else {}
+        net=(q.get("type") or q.get("network") or "tcp").lower()
+        sec=(q.get("security") or "").lower()
+        name=frag or q.get("remark") or f"vless-{host}-{tail(uid)}"
+        p={"name":uniq_name(name),"type":"vless","server":host,"port":safe_int(port,443),"uuid":uid,"encryption":q.get("encryption") or "none","network":net,"udp":True}
+        if sec=="tls": p["tls"]=True; p["servername"]=q.get("sni") or q.get("host") or host
+        if net=="ws": ws_path=q.get("path") or "/"; hosth=q.get("host") or q.get("Host") or ""; p["ws-opts"]={"path":ws_path}; 
+        if hosth: p["ws-opts"]["headers"]={"Host":hosth}
+        return p
+    except: return None
+
+def parse_vmess(line):
+    try:
+        raw=line[8:].strip(); decoded=None
+        try: decoded=base64.b64decode(b64fix(raw)).decode("utf-8","ignore"); js=json.loads(decoded)
+        except: 
+            try: js=json.loads(unquote(raw))
+            except: return None
+        host=js.get("add") or js.get("address") or js.get("server")
+        port=safe_int(js.get("port") or js.get("ps") or 0)
+        uid=js.get("id") or js.get("uuid")
+        if not (host and port and uid): return None
+        net=(js.get("net") or "tcp").lower()
+        name=js.get("ps") or f"vmess-{host}-{tail(uid)}"
+        p={"name":uniq_name(name),"type":"vmess","server":host,"port":port,"uuid":uid,"alterId":safe_int(js.get("aid",js.get("alterId",0))),"cipher":js.get("cipher") or js.get("scy") or "auto","network":net,"udp":True}
+        if js.get("tls")=="tls": p["tls"]=True; p["servername"]=js.get("sni") or js.get("host") or host
+        if net=="ws": p["ws-opts"]={"path":js.get("path") or "/","headers":{"Host":js.get("host") or ""}}
+        return p
+    except: return None
+
+def parse_trojan(line):
+    try:
+        parsed=urlparse(line); pwd=parsed.username or ""
+        host=parsed.hostname or ""; port=parsed.port or 443; frag=parsed.fragment or ""
+        if not host: return None
+        name=frag or f"trojan-{host}"
+        p={"name":uniq_name(name),"type":"trojan","server":host,"port":port,"password":pwd,"udp":True,"network":"tcp"}
+        return p
+    except: return None
+
+# ---------------- Master parse_any ----------------
+PARSE_FUNCS=[parse_vless,parse_vmess,parse_trojan]  # بقیه پروتکل‌ها اضافه شوند
+
+def parse_line_any(line):
+    line=line.strip(); line_l=line.lower()
+    for p in PARSE_FUNCS:
+        r=p(line)
+        if r: return [r]
+    return []
+
+def parse_any(text):
+    proxies=[]
+    lines=[ln.strip() for ln in text.splitlines() if ln.strip()]
+    for ln in lines: proxies+=parse_line_any(ln)
+    normalized=[]
+    for p in proxies:
+        if not isinstance(p,dict): continue
+        p["port"]=int(safe_int(p.get("port",0)))
+        if not p.get("name"): p["name"]=uniq_name(f"{p.get('type')}-{p.get('server')}-{tail(p.get('port'))}")
+        else: p["name"]=uniq_name(p["name"])
+        normalized.append(p)
+    return normalized
+
+# ---------------- Deduplicate ----------------
+def dedupe_proxies(proxies):
+    final=[]; seen=set()
+    for p in proxies:
+        key=(p.get("type"),p.get("server"),int(safe_int(p.get("port"))),p.get("uuid") or p.get("password") or "")
+        if key in seen: continue
+        seen.add(key); final.append(p)
+    return final
+
+# ---------------- YAML Output ----------------
+def generate_yaml(text):
+    proxies=parse_any(text)
+    if not proxies: print("[!] No valid proxies."); return None,[]
+
+    proxies=dedupe_proxies(proxies)
+
+    # Ping + Alive
+    with ThreadPoolExecutor(max_workers=30) as ex:
+        futures={ex.submit(tcp_ping,p["server"],p["port"]):p for p in proxies}
+        for f in as_completed(futures):
+            p=futures[f]; ping=f.result(); p["ping"]=ping; p["alive"]=ping is not None
+
+    good=[p for p in proxies if p.get("alive")]
+    good.sort(key=lambda x:x.get("ping") or 9999)
+    if not good: print("[!] No alive proxies."); return None,[]
+
+    names=[p["name"] for p in good]
+    config={"proxies":good,"proxy-groups":[
+        {"name":"👆almasi98","type":"select","proxies":["📌TEST","🔰 Selector","💎 Stable","🏆 BestPing","🕹Fallback","DIRECT"]+names},
+        {"name":"📌TEST","type":"url-test","url":"http://www.google.com/generate_204","interval":60,"proxies":names},
+        {"name":"🔰 Selector","type":"select","proxies":names},
+        {"name":"⚡ UltraFast","type":"url-test","url":"https://www.gstatic.com/generate_204","tolerance":20,"interval":20,"proxies":names},
+        {"name":"💎 Stable","type":"fallback","url":"https://www.gstatic.com/generate_204","interval":25,"proxies":names},
+        {"name":"🏆 BestPing","type":"url-test","url":"https://www.gstatic.com/generate_204","tolerance":10,"interval":15,"proxies":names},
+        {"name":"🕹Fallback","type":"select","proxies":names}
+    ],"rules":["MATCH,🔰 Selector"]}
+    return config,good
+
+# ---------------- Smart AutoSwitch ----------------
+def smart_auto_switch(config,good_sorted):
+    if not good_sorted: return
+    autoswitch=AutoSwitch(good_sorted)
+    def loop():
+        while True:
+            autoswitch.loop(interval=10)
+            with open(OUT_PATH,"w",encoding="utf-8") as f: yaml.safe_dump(config,f,allow_unicode=True,sort_keys=False)
+    threading.Thread(target=loop,daemon=True).start()
+
+# ---------------- Main ----------------
+if __name__=="__main__":
+    with open(INPUT_PATH,"r",encoding="utf-8") as f: text=f.read()
+    if not text.strip(): print("Input file empty."); sys.exit(0)
+    config,good=generate_yaml(text)
+    if not config: sys.exit(1)
+    smart_auto_switch(config,good)
+    with open(OUT_PATH,"w",encoding="utf-8") as f: yaml.safe_dump(config,f,allow_unicode=True,sort_keys=False)
+    print(f"\n[OK] Saved → {OUT_PATH}\n")
+

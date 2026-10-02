@@ -1,0 +1,305 @@
+#!/data/data/com.termux/files/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+# ========================================================
+# Ultimate Proxy Parser + Smart Switch Engine (FINAL)
+# ========================================================
+
+import os, re, yaml, socket, time, threading, subprocess
+from urllib.parse import urlparse, parse_qs, unquote
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+
+# ========================================================
+# ----------------- PATHS & FILES -----------------------
+# ========================================================
+BASE_DIR = "/storage/emulated/0/Download/Akbar98"
+os.makedirs(BASE_DIR, exist_ok=True)
+INPUT_PATH = os.path.join(BASE_DIR, "input.txt")
+
+# ایجاد فایل ورودی خام
+with open(INPUT_PATH, "w", encoding="utf-8") as f:
+    f.write("")
+subprocess.call(["nano", INPUT_PATH])
+
+out_folder = input("Enter output folder name in Download: ").strip()
+if not out_folder:
+    print("Folder name required."); exit(1)
+OUT_DIR = os.path.join("/storage/emulated/0/Download", out_folder)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+out_name = input("Enter output file name (without extension): ").strip()
+if not out_name:
+    print("File name required."); exit(1)
+OUT_PATH = os.path.join(OUT_DIR, f"{out_name}.yaml")
+
+# ========================================================
+# ----------------- VALID CIPHERS -----------------------
+# ========================================================
+VALID_SS_CIPHERS = {
+    "aes-128-ctr","aes-192-ctr","aes-256-ctr",
+    "aes-128-cfb","aes-192-cfb","aes-256-cfb",
+    "aes-128-gcm","aes-192-gcm","aes-256-gcm",
+    "aes-128-ccm","aes-192-ccm","aes-256-ccm",
+    "aes-128-gcm-siv","aes-256-gcm-siv",
+    "chacha20-ietf","chacha20-ietf-poly1305",
+    "xchacha20-ietf-poly1305",
+    "2022-blake3-aes-128-gcm",
+    "2022-blake3-aes-256-gcm",
+    "2022-blake3-chacha20-poly1305"
+}
+
+# ========================================================
+# ----------------- HELPERS -----------------------------
+# ========================================================
+def safe_int(x, default=0):
+    try: return int(x)
+    except: return default
+
+def sanitize(s: str) -> str:
+    if not s: return ""
+    return re.sub(r"[^A-Za-z0-9_\- .]", "", str(s)).strip()
+
+_used_names = set()
+def uniq_name(base: str) -> str:
+    base = sanitize(base) or "Proxy"
+    name = base
+    i = 2
+    while name in _used_names:
+        name = f"{base} {i}"; i += 1
+    _used_names.add(name)
+    return name
+
+def tail(s: str, n=6):
+    if not s: return ""
+    s2 = re.sub(r"[-]","",s)
+    return s2[-n:] if len(s2) >= n else s2
+
+# ========================================================
+# ----------------- TCP PING -----------------------------
+# ========================================================
+def tcp_ping_once(host, port, timeout=0.5):
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        start = time.time()
+        sock.connect((host, int(port)))
+        sock.close()
+        return int((time.time()-start)*1000)
+    except:
+        return None
+
+def tcp_ping_median(host, port, attempts=3):
+    results=[]
+    for _ in range(attempts):
+        r=tcp_ping_once(host, port)
+        if r is not None: results.append(r)
+    if not results: return None
+    results.sort()
+    mid=len(results)//2
+    if len(results)%2: return results[mid]
+    return (results[mid-1]+results[mid])//2
+
+# ========================================================
+# ----------------- PARSERS -----------------------------
+# ========================================================
+def parse_vless(line):
+    if not line.lower().startswith("vless://"): return None
+    try:
+        raw=line[8:]; name=""
+        if "#" in raw: raw,name=raw.split("#",1); name=unquote(name)
+        if "@" not in raw: return None
+        main,q=(raw.split("?",1)+[""])[:2]
+        q=dict(x.split("=",1) for x in q.split("&") if "=" in x)
+        uid,rest=main.split("@",1)
+        host,port=(rest.split(":",1)+["443"])[:2]
+        p = {
+            "name": uniq_name(name or f"vless-{host}-{tail(uid)}"),
+            "type":"vless","server":host,"port":safe_int(port,443),
+            "uuid":uid,"udp":True,
+            "network":q.get("type") or "tcp",
+            "encryption":q.get("encryption","none")
+        }
+        if q.get("security")=="tls":
+            p["tls"]=True; p["servername"]=q.get("sni") or host
+        if p["network"]=="ws":
+            p["ws-opts"]={"path":q.get("path","/")}
+            if q.get("host"): p["ws-opts"]["headers"]={"Host":q.get("host")}
+        if p["network"]=="grpc" and q.get("serviceName"):
+            p["grpc-opts"]={"grpc-service-name":q.get("serviceName")}
+        return p
+    except: return None
+
+def parse_trojan(line):
+    if not line.lower().startswith("trojan://"): return None
+    try:
+        u=urlparse(line)
+        if not u.hostname or not u.username: return None
+        p={
+            "name":uniq_name(u.fragment or f"trojan-{u.hostname}"),
+            "type":"trojan",
+            "server":u.hostname,
+            "port":u.port or 443,
+            "password":u.username,
+            "udp":True
+        }
+        q=parse_qs(u.query)
+        if q.get("sni"): p["sni"]=q["sni"][0]
+        if q.get("type",[""])[0]=="ws":
+            p["network"]="ws"
+            p["ws-opts"]={"path":q.get("path",["/"])[0]}
+        return p
+    except: return None
+
+def parse_ss(line):
+    if not line.lower().startswith("ss://"): return None
+    try:
+        body=line[5:]; name=""
+        if "#" in body: body,name=body.split("#",1); name=unquote(name)
+        if "@" not in body or ":" not in body: return None
+        c,addr=body.split("@",1); method,password=c.split(":",1); host,port=addr.split(":",1)
+        if method not in VALID_SS_CIPHERS: return None
+        return {"name":uniq_name(name or f"ss-{host}"),
+                "type":"ss","server":host,"port":safe_int(port),
+                "cipher":method,"password":password,"udp":True}
+    except: return None
+
+def parse_http(line):
+    if not line.lower().startswith("http://"): return None
+    try:
+        u=urlparse(line)
+        if not u.hostname or not u.port: return None
+        return {"name":uniq_name(f"http-{u.hostname}"),
+                "type":"http","server":u.hostname,
+                "port":u.port,
+                "username":u.username or "",
+                "password":u.password or "",
+                "udp":False}
+    except: return None
+
+def parse_socks(line):
+    if not (line.lower().startswith("socks://") or line.lower().startswith("socks5://")): return None
+    try:
+        u=urlparse(line)
+        if not u.hostname or not u.port: return None
+        return {"name":uniq_name(f"socks-{u.hostname}"),
+                "type":"socks5","server":u.hostname,
+                "port":u.port,
+                "username":u.username or "",
+                "password":u.password or "",
+                "udp":True}
+    except: return None
+
+def parse_ipport(line):
+    if ":" in line and "://" not in line:
+        try:
+            host,port=line.split(":",1)
+            return {"name":uniq_name(f"raw-{host}"),
+                    "type":"http",
+                    "server":host,
+                    "port":safe_int(port),
+                    "udp":True}
+        except: return None
+    return None
+
+def parse_line_any(line):
+    for fn in (parse_vless,parse_trojan,parse_ss,parse_http,parse_socks):
+        p=fn(line)
+        if p: return [p]
+    p=parse_ipport(line)
+    return [p] if p else []
+
+def parse_any(text):
+    proxies=[]
+    for ln in text.splitlines():
+        ln=ln.strip()
+        if not ln: continue
+        proxies.extend(parse_line_any(ln))
+    return proxies
+
+# ========================================================
+# ----------------- LOAD & PARSE INPUT ------------------
+# ========================================================
+raw_input=""
+try: raw_input=open(INPUT_PATH,"r",encoding="utf-8").read()
+except: pass
+parsed_proxies=parse_any(raw_input)
+
+# ========================================================
+# --------------- DEDUPE & VALIDATE ---------------------
+# ========================================================
+def dedupe_proxies(items):
+    seen=set(); out=[]
+    for p in items:
+        key=(p.get("type"),p.get("server"),safe_int(p.get("port")),
+             p.get("uuid") or p.get("password") or "")
+        if key in seen: continue
+        seen.add(key); out.append(p)
+    return out
+
+def validate_proxy(p):
+    if not isinstance(p,dict): return False
+    if not p.get("type") or not p.get("server"): return False
+    pt=safe_int(p.get("port"))
+    if not (1<=pt<=65535): return False
+    t=p.get("type")
+    if t in ("vless","vmess") and not p.get("uuid"): return False
+    if t=="trojan" and not p.get("password"): return False
+    if t=="ss" and not (p.get("cipher") and p.get("password")): return False
+    return True
+
+proxies=dedupe_proxies(parsed_proxies)
+proxies=[p for p in proxies if validate_proxy(p)]
+
+# ========================================================
+# ----------------- TCP PING -----------------------------
+# ========================================================
+def attach_ping(proxy):
+    host=proxy.get("server"); port=proxy.get("port")
+    if not host or not port:
+        proxy.update({"ping":None,"status":"dead"}); return proxy
+    ping=tcp_ping_median(host, port, attempts=3)
+    proxy["ping"]=ping
+    proxy["status"]="ok" if ping else "dead"
+    return proxy
+
+final_proxies=[]
+if proxies:
+    with ThreadPoolExecutor(max_workers=min(40,len(proxies))) as ex:
+        futures=[ex.submit(attach_ping,p) for p in proxies]
+        for fut in as_completed(futures):
+            try: final_proxies.append(fut.result())
+            except: pass
+
+# ========================================================
+# ----------------- GROUPS -------------------------------
+# ========================================================
+# نام گروه‌ها
+Select   = "🎲🕹Select🕹🎲"
+Auto     = "💎📌Auto📌💎"
+Stable   = "🛡🧩Stable🧩🛡"
+Fallback = "🎀🎯Fallback🎯🎀"
+T1       = "🎏🔗T1🔗🎏"
+T2       = "🚀🪀T2🪀🚀"
+T3       = "🥌🎖T3🎖🥌"
+
+proxy_names=[p["name"] for p in final_proxies if p.get("status")=="ok"]
+
+config = {
+    "proxies": final_proxies,
+    "proxy-groups":[
+        {"name":Select,"type":"select","proxies":[Auto,Stable,Fallback,"DIRECT"]+proxy_names},
+        {"name":Auto,"type":"url-test","url":"https://www.gstatic.com/generate_204","interval":2,"timeout":101,"tolerance":10,"proxies":proxy_names},
+        {"name":Stable,"type":"fallback","url":"https://www.gstatic.com/generate_204","interval":3,"timeout":1,"proxies":proxy_names},
+        {"name":Fallback,"type":"fallback","url":"https://www.gstatic.com/generate_204","interval":2080,"timeout":333,"tolerance":500,"proxies":proxy_names},
+        {"name":T1,"type":"url-test","url":"https://www.gstatic.com/generate_204","interval":1895,"timeout":11,"tolerance":80,"proxies":proxy_names},
+        {"name":T2,"type":"fallback","url":"https://www.gstatic.com/generate_204","interval":300,"timeout":9,"proxies":proxy_names},
+        {"name":T3,"type":"fallback","url":"https://www.gstatic.com/generate_204","interval":2986,"timeout":15,"tolerance":150,"proxies":proxy_names}
+    ],
+    "rules":[f"MATCH,{Select}"]
+}
+
+with open(OUT_PATH,"w",encoding="utf-8") as f:
+    yaml.safe_dump(config,f,allow_unicode=True,sort_keys=False)
+
+print(f"[✅] Saved {len(final_proxies)} proxies → {OUT_PATH}")

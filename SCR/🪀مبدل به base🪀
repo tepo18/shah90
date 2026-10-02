@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+import os
+import json
+import base64
+
+# ================== مسیرها ==================
+BASE_DIR = "/storage/emulated/0/Download/input.txt"  # مسیر ورودی جهت خواندن فایل‌ها
+OUTPUT_DIR = "/storage/emulated/0/Download/v2ray.txt"  # مسیر خروجی جهت ذخیره محتوا
+
+# بررسی وجود پوشه خروجی
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ================== HELPERS ==================
+def b64e(s: str) -> str:
+    """تبدیل رشته به Base64"""
+    return base64.b64encode(s.encode()).decode()
+
+def fix_vmess(link):
+    """تبدیل لینک vmess به Base64"""
+    try:
+        raw = link.replace("vmess://", "")
+        j = json.loads(base64.b64decode(raw + "===").decode())
+        clean = json.dumps(j, separators=(",", ":"))
+        return "vmess://" + b64e(clean)
+    except Exception as e:
+        return None
+
+def fix_ss(link):
+    """تبدیل لینک ss به Base64"""
+    try:
+        raw = link.replace("ss://", "").split("#")[0]
+        base64.b64decode(raw + "===")
+        return "ss://" + raw
+    except Exception as e:
+        try:
+            return "ss://" + b64e(raw)
+        except Exception as e:
+            return None
+
+def normalize(line):
+    """تبدیل خطوط پروتکل‌ها به Base64"""
+    line = line.strip()
+    if not line:
+        return None
+
+    if line.startswith("vmess://"):
+        return fix_vmess(line)
+    if line.startswith("ss://"):
+        return fix_ss(line)
+    if line.startswith((
+        "vless://", "trojan://", "hysteria://", "hysteria2://",
+        "tuic://", "socks://", "http://", "https://"
+    )):
+        return line
+    return None
+
+# ================== جستجو و پردازش فایل‌ها ==================
+def process_files():
+    # بررسی اینکه مسیر ورودی فایل واقعی است و پوشه نیست
+    if not os.path.isdir(BASE_DIR):
+        print(f"[Error] {BASE_DIR} is not a valid directory.")
+        return
+
+    # دریافت تمام فایل‌های با پسوند .txt در پوشه input.txt
+    files_to_process = [f for f in os.listdir(BASE_DIR) if f.endswith('.txt')]
+    
+    if not files_to_process:
+        print(f"[Error] No .txt files found in {BASE_DIR}.")
+        return
+
+    # پردازش هر فایل موجود در پوشه input.txt
+    for file_name in files_to_process:
+        file_path = os.path.join(BASE_DIR, file_name)
+        print(f"\nProcessing file: {file_path}")
+        
+        # خواندن محتویات فایل و پردازش خطوط
+        all_configs = []
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as file:
+            for line in file:
+                processed_line = normalize(line)
+                if processed_line:
+                    all_configs.append(processed_line)
+
+        # ================== ذخیره خروجی به فایل ==================
+        output_base_path = os.path.join(OUTPUT_DIR, "base.txt")
+        
+        # بررسی اینکه آیا فایل با همین نام وجود دارد و شماره‌گذاری انجام دهیم
+        base_name = "base.txt"
+        output_path = output_base_path
+        counter = 1
+        
+        # اگر فایل با نام مشابه وجود داشته باشد، شماره‌گذاری کنیم
+        while os.path.exists(output_path):
+            output_path = os.path.join(OUTPUT_DIR, f"base{counter}.txt")
+            counter += 1
+
+        # نوشتن خروجی Base64 در فایل جدید
+        subscription_raw = "\n".join(all_configs)
+        subscription_b64 = base64.b64encode(subscription_raw.encode()).decode()
+
+        with open(output_path, "w", encoding="utf-8") as base_file:
+            base_file.write(subscription_b64)
+
+        print(f"[✓] Processed and saved to: {output_path}")
+
+    print("\n[✓] All files processed successfully!")
+
+# اجرای پردازش
+process_files()

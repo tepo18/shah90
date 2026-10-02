@@ -1,0 +1,810 @@
+#!/data/data/com.termux/files/usr/bin/python3
+import os, re, json, yaml, subprocess, base64, socket, time
+from urllib.parse import urlparse, parse_qs, unquote
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+import threading
+
+# ---------------- paths & editor ----------------
+BASE_DIR = "/storage/emulated/0/Download/Akbar98"
+os.makedirs(BASE_DIR, exist_ok=True)
+INPUT_PATH = os.path.join(BASE_DIR, "input.txt")
+
+with open(INPUT_PATH, "w", encoding="utf-8") as f:
+    f.write("")
+subprocess.call(["nano", INPUT_PATH])
+
+out_folder = input("Enter output folder name in Download: ").strip()
+if not out_folder:
+    print("Folder name required."); exit(1)
+OUT_DIR = os.path.join("/storage/emulated/0/Download", out_folder)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+out_name = input("Enter output file name (without extension): ").strip()
+if not out_name:
+    print("File name required."); exit(1)
+OUT_PATH = os.path.join(OUT_DIR, f"{out_name}.yaml")
+
+# ---------------- valid ciphers ----------------
+VALID_SS_CIPHERS = {
+    "aes-128-ctr", "aes-192-ctr", "aes-256-ctr",
+    "aes-128-cfb", "aes-192-cfb", "aes-256-cfb",
+    "aes-128-gcm", "aes-192-gcm", "aes-256-gcm",
+    "aes-128-ccm", "aes-192-ccm", "aes-256-ccm",
+    "aes-128-gcm-siv", "aes-256-gcm-siv",
+    "chacha20-ietf", "chacha20-ietf-poly1305",
+    "xchacha20-ietf-poly1305",
+    "2022-blake3-aes-128-gcm",
+    "2022-blake3-aes-256-gcm",
+    "2022-blake3-chacha20-poly1305"
+}
+
+# ---------------- helpers ----------------
+def b64fix(s: str) -> str:
+    s = s.strip().replace("\n","").replace(" ","")
+    pad = len(s) % 4
+    if pad: s += "=" * (4 - pad)
+    return s
+
+def safe_int(x, default=0):
+    try: return int(x)
+    except: return default
+
+def sanitize(s: str) -> str:
+    if not s: return ""
+    return re.sub(r"[^A-Za-z0-9_\- .]", "", str(s)).strip()
+
+_used_names = set()
+def uniq_name(base: str) -> str:
+    base = sanitize(base) or "Proxy"
+    name = base
+    i = 2
+    while name in _used_names:
+        name = f"{base} {i}"; i += 1
+    _used_names.add(name)
+    return name
+
+def tail(s: str, n=6):
+    if not s: return ""
+    s2 = re.sub(r"[-]","",s)
+    return s2[-n:] if len(s2) >= n else s2
+
+# ---------------- TCP ping ----------------
+def tcp_ping_once(host, port, timeout=0.2):
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        start = time.time()
+        sock.connect((host, port))
+        sock.close()
+        return int((time.time() - start) * 1000)
+    except:
+        return None
+
+def tcp_ping_median(host, port, attempts=7):
+    pings = []
+    for _ in range(attempts):
+        p = tcp_ping_once(host, port)
+        if p is not None: pings.append(p)
+    if pings:
+        pings.sort()
+        mid = len(pings) // 2
+        return pings[mid] if len(pings) % 2 else (pings[mid-1]+pings[mid])//2
+    return None
+
+def tcp_ping_ms(host, port, timeout=0.2):
+    try:
+        start = time.monotonic()
+        sock = socket.create_connection((host, int(port)), timeout=timeout)
+        sock.close()
+        return int((time.monotonic() - start) * 1000)
+    except Exception:
+        return None
+
+def attach_ping(proxy):
+    proxy['ping'] = tcp_ping_median(proxy['server'], proxy['port'])
+    proxy['status'] = "ok" if proxy['ping'] is not None else "fail"
+    return proxy
+
+# ----------------- read input -----------------
+try:
+    with open(INPUT_PATH, "r", encoding="utf-8") as f:
+        content = f.read()
+except Exception:
+    content = ""
+from urllib.parse import urlparse, parse_qs, unquote
+
+# ================== JSON extractor (برای سازگاری – استفاده نمی‌شود) ==================
+def extract_json_objects(text):
+    return []
+
+
+# ================== PROTOCOL PARSERS (LINEAR ONLY) ==================
+
+def parse_vless(line):
+    if not line.lower().startswith("vless://"):
+        return None
+    try:
+        raw = line[8:]
+        name = ""
+        if "#" in raw:
+            raw, name = raw.split("#", 1)
+            name = unquote(name)
+
+        if "@" not in raw:
+            return None
+
+        if "?" in raw:
+            main, qs = raw.split("?", 1)
+            q = dict(x.split("=",1) for x in qs.split("&") if "=" in x)
+        else:
+            main, q = raw, {}
+
+        uuid, rest = main.split("@", 1)
+        host, port = rest.split(":",1) if ":" in rest else (rest, "443")
+
+        p = {
+            "name": uniq_name(name or f"vless-{host}-{tail(uuid)}"),
+            "type": "vless",
+            "server": host,
+            "port": safe_int(port,443),
+            "uuid": uuid,
+            "encryption": q.get("encryption","none"),
+            "network": (q.get("type") or q.get("network") or "tcp"),
+            "udp": True
+        }
+
+        if q.get("security") == "tls":
+            p["tls"] = True
+            p["servername"] = q.get("sni") or q.get("host") or host
+
+        if p["network"] == "ws":
+            p["ws-opts"] = {"path": q.get("path","/")}
+            if q.get("host"):
+                p["ws-opts"]["headers"] = {"Host": q.get("host")}
+
+        if p["network"] == "grpc" and q.get("serviceName"):
+            p["grpc-opts"] = {"grpc-service-name": q.get("serviceName")}
+
+        return p
+    except:
+        return None
+
+
+def parse_trojan(line):
+    if not line.lower().startswith("trojan://"):
+        return None
+    try:
+        u = urlparse(line)
+        if not u.hostname or not u.username:
+            return None
+
+        p = {
+            "name": uniq_name(u.fragment or f"trojan-{u.hostname}"),
+            "type": "trojan",
+            "server": u.hostname,
+            "port": u.port or 443,
+            "password": u.username,
+            "udp": True
+        }
+
+        q = parse_qs(u.query)
+        if q.get("sni"):
+            p["sni"] = q["sni"][0]
+
+        if q.get("type",[""])[0] == "ws":
+            p["network"] = "ws"
+            p["ws-opts"] = {"path": q.get("path",["/"])[0]}
+
+        return p
+    except:
+        return None
+
+
+def parse_ss(line):
+    if not line.lower().startswith("ss://"):
+        return None
+    try:
+        body = line[5:]
+        name = ""
+        if "#" in body:
+            body, name = body.split("#",1)
+            name = unquote(name)
+
+        if "@" not in body or ":" not in body:
+            return None
+
+        creds, addr = body.split("@",1)
+        method, password = creds.split(":",1)
+        host, port = addr.split(":",1)
+
+        return {
+            "name": uniq_name(name or f"ss-{host}"),
+            "type": "ss",
+            "server": host,
+            "port": safe_int(port),
+            "cipher": method,
+            "password": password,
+            "udp": True
+        }
+    except:
+        return None
+
+
+def parse_hysteria1(line):
+    if not line.lower().startswith("hy://"):
+        return None
+    try:
+        raw = line[5:]
+        if "@" not in raw:
+            return None
+        auth, rest = raw.split("@",1)
+        host, port = rest.split(":",1)
+
+        return {
+            "name": uniq_name(f"hysteria-{host}"),
+            "type": "hysteria",
+            "server": host,
+            "port": safe_int(port),
+            "auth": auth,
+            "udp": True
+        }
+    except:
+        return None
+
+
+def parse_hysteria2(line):
+    if not (line.lower().startswith("hy2://") or line.lower().startswith("hysteria2://")):
+        return None
+    try:
+        raw = line.split("://",1)[1]
+        auth, rest = raw.split("@",1)
+        host, port = rest.split(":",1)
+
+        return {
+            "name": uniq_name(f"hysteria2-{host}"),
+            "type": "hysteria2",
+            "server": host,
+            "port": safe_int(port),
+            "password": auth,
+            "udp": True
+        }
+    except:
+        return None
+
+
+def parse_http(line):
+    if not line.lower().startswith("http://"):
+        return None
+    try:
+        u = urlparse(line)
+        if not u.hostname or not u.port:
+            return None
+
+        return {
+            "name": uniq_name(f"http-{u.hostname}"),
+            "type": "http",
+            "server": u.hostname,
+            "port": u.port,
+            "username": u.username or "",
+            "password": u.password or "",
+            "udp": False
+        }
+    except:
+        return None
+
+
+def parse_socks(line):
+    if not (line.lower().startswith("socks://") or line.lower().startswith("socks5://")):
+        return None
+    try:
+        u = urlparse(line)
+        if not u.hostname or not u.port:
+            return None
+
+        return {
+            "name": uniq_name(f"socks-{u.hostname}"),
+            "type": "socks5",
+            "server": u.hostname,
+            "port": u.port,
+            "username": u.username or "",
+            "password": u.password or "",
+            "udp": True
+        }
+    except:
+        return None
+
+
+# ---------- FALLBACK: RAW IP:PORT ----------
+def parse_ipport(line):
+    if ":" in line and "://" not in line:
+        try:
+            host, port = line.split(":",1)
+            return {
+                "name": uniq_name(f"raw-{host}"),
+                "type": "http",
+                "server": host,
+                "port": safe_int(port),
+                "udp": True
+            }
+        except:
+            return None
+    return None
+
+
+# ================== MASTER ==================
+def parse_line_any(line):
+    for fn in (
+        parse_vless,
+        parse_trojan,
+        parse_ss,
+        parse_hysteria1,
+        parse_hysteria2,
+        parse_http,
+        parse_socks
+    ):
+        p = fn(line)
+        if p:
+            return [p]
+
+    p = parse_ipport(line)
+    return [p] if p else []
+
+
+def parse_any(text):
+    proxies = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        proxies.extend(parse_line_any(ln))
+    return proxies
+# ================== RUN PARSER ON INPUT ==================
+
+print("[*] Reading input...")
+try:
+    with open(INPUT_PATH, "r", encoding="utf-8") as f:
+        raw_input = f.read()
+except Exception:
+    raw_input = ""
+
+print("[*] Parsing proxies...")
+parsed_proxies = parse_any(raw_input)
+
+if not parsed_proxies:
+    print("[!] No proxies parsed from input.")
+    proxies = []
+else:
+    print(f"[+] Parsed {len(parsed_proxies)} raw proxies")
+
+# ================== DEDUPE ==================
+def dedupe_proxies(items):
+    seen = set()
+    out = []
+    for p in items:
+        key = (
+            p.get("type"),
+            p.get("server"),
+            int(safe_int(p.get("port"))),
+            p.get("uuid") or p.get("password") or p.get("auth") or ""
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+proxies = dedupe_proxies(parsed_proxies)
+print(f"[+] {len(proxies)} unique proxies after dedupe")
+
+# ================== BASIC VALIDATION ==================
+def validate_proxy(p):
+    if not isinstance(p, dict):
+        return False
+    if not p.get("type") or not p.get("server"):
+        return False
+
+    port = safe_int(p.get("port"))
+    if not (1 <= port <= 65535):
+        return False
+
+    t = p.get("type")
+    if t in ("vless","vmess") and not p.get("uuid"):
+        return False
+    if t == "trojan" and not p.get("password"):
+        return False
+    if t == "ss" and not (p.get("cipher") and p.get("password")):
+        return False
+
+    return True
+
+proxies = [p for p in proxies if validate_proxy(p)]
+print(f"[+] {len(proxies)} proxies passed validation")
+
+# ================== PING ATTACH ==================
+def check_and_attach_ping(proxy):
+    host = proxy.get("server")
+    port = proxy.get("port")
+
+    if not host or not port:
+        proxy["ping"] = None
+        proxy["status"] = "dead"
+        return proxy
+
+    ping = tcp_ping_ms(host, port, timeout=2)
+    if ping is None:
+        proxy["ping"] = None
+        proxy["status"] = "dead"
+    else:
+        proxy["ping"] = ping
+        proxy["status"] = "ok"
+
+    return proxy
+
+# ================== TCP PING ==================
+results = []
+if proxies:
+    print("[*] Checking TCP ping...")
+    with ThreadPoolExecutor(max_workers=min(40, len(proxies))) as ex:
+        futures = [ex.submit(check_and_attach_ping, p) for p in proxies]
+        for fut in as_completed(futures):
+            try:
+                results.append(fut.result())
+            except:
+                pass
+else:
+    results = []
+
+final_proxies = results
+alive = [p for p in final_proxies if p.get("status") == "ok"]
+
+print(f"[+] {len(alive)} alive proxies")
+
+# ================== HARD GATE PING ==================
+MAX_PING_ALLOWED = 1500
+PING_ATTEMPTS = 7
+MIN_SUCCESS_PINGS = 4
+
+def hard_ping_test(proxy):
+    host = proxy.get("server")
+    port = safe_int(proxy.get("port"))
+    if not host or not (1 <= port <= 65535):
+        return None
+
+    pings = []
+    for _ in range(PING_ATTEMPTS):
+        p = tcp_ping_ms(host, port, timeout=1.5)
+        if p is not None:
+            pings.append(p)
+
+    if len(pings) < MIN_SUCCESS_PINGS:
+        return None
+
+    pings.sort()
+    mid = len(pings) // 2
+    median = pings[mid] if len(pings) % 2 else (pings[mid-1] + pings[mid]) // 2
+    variance = max(pings) - min(pings)
+
+    if median > MAX_PING_ALLOWED:
+        return None
+
+    proxy["ping"] = median
+    proxy["variance"] = variance
+    proxy["status"] = "ok"
+    return proxy
+
+# ================== APPLY HARD GATE ==================
+print("[*] Running HARD ping gate...")
+
+gated = []
+with ThreadPoolExecutor(max_workers=min(40, len(proxies))) as ex:
+    futures = [ex.submit(hard_ping_test, p) for p in proxies]
+    for f in as_completed(futures):
+        try:
+            r = f.result()
+            if r:
+                gated.append(r)
+        except:
+            pass
+
+print(f"[+] {len(gated)} proxies passed HARD gate")
+
+# ================== FINAL SORT ==================
+final_proxies = sorted(
+    gated,
+    key=lambda x: (x.get("ping", 9999), x.get("variance", 9999))
+)
+
+proxy_names = [p["name"] for p in final_proxies]
+
+# ================== GROUP BUILD (HOT CORE) ==================
+HOT_CORE = {
+    "Auto": 5,
+    "Stable": 5,
+    "Fallback": 3,
+    "T1": 3,
+    "T2": 4,
+    "T3": 2,
+}
+
+def build_group(name):
+    core = HOT_CORE.get(name, 3)
+    return [p["name"] for p in final_proxies[:core]]
+
+# ================== YAML ==================
+Select, Auto, Stable, Fallback, T1, T2, T3 = \
+"Select","Auto","Stable","Fallback","T1","T2","T3"
+
+
+
+# ========================================================
+# ----------------- LOAD & PARSE INPUT ------------------
+# ========================================================
+raw_input=""
+try: raw_input=open(INPUT_PATH,"r",encoding="utf-8").read()
+except: pass
+parsed_proxies=parse_any(raw_input)
+
+# ========================================================
+# --------------- DEDUPE & VALIDATE ---------------------
+# ========================================================
+def dedupe_proxies(items):
+    seen=set(); out=[]
+    for p in items:
+        key=(p.get("type"),p.get("server"),safe_int(p.get("port")),
+             p.get("uuid") or p.get("password") or "")
+        if key in seen: continue
+        seen.add(key); out.append(p)
+    return out
+
+def validate_proxy(p):
+    if not isinstance(p,dict): return False
+    if not p.get("type") or not p.get("server"): return False
+    pt=safe_int(p.get("port"))
+    if not (1<=pt<=65535): return False
+    t=p.get("type")
+    if t in ("vless","vmess") and not p.get("uuid"): return False
+    if t=="trojan" and not p.get("password"): return False
+    if t=="ss" and not (p.get("cipher") and p.get("password")): return False
+    return True
+
+proxies=dedupe_proxies(parsed_proxies)
+proxies=[p for p in proxies if validate_proxy(p)]
+
+# ========================================================
+# ----------------- TCP PING -----------------------------
+# ========================================================
+def attach_ping(proxy):
+    host=proxy.get("server"); port=proxy.get("port")
+    if not host or not port:
+        proxy.update({"ping":None,"status":"dead"}); return proxy
+    ping=tcp_ping_median(host, port, attempts=3)
+    proxy["ping"]=ping
+    proxy["status"]="ok" if ping else "dead"
+    return proxy
+
+final_proxies=[]
+if proxies:
+    with ThreadPoolExecutor(max_workers=min(40,len(proxies))) as ex:
+        futures=[ex.submit(attach_ping,p) for p in proxies]
+        for fut in as_completed(futures):
+            try: final_proxies.append(fut.result())
+            except: pass
+            
+            # ========================================================
+# ----------------- GROUPS -------------------------------
+# ========================================================
+
+Select   = "🎲🕹Select🕹🎲"
+Auto     = "💎📌Auto📌💎"
+Stable   = "🛡🧩Stable🧩🛡"
+Fallback = "🎀🎯Fallback🎯🎀"
+
+T1  = "🎏🔗G1🔗🎏"
+T2  = "🚀🪀G2🪀🚀"
+T3  = "🥌🎖G3🎖🥌"
+T5  = "🚀🪀G4🪀🚀"
+T6  = "🥌🎖G5🎖🥌"
+T7  = "🎏🔗H1🔗🎏"
+T8  = "🚀🪀H2🪀🚀"
+T9  = "🥌🎖H3🎖🥌"
+T10 = "🎏🔗H4🔗🎏"
+T20 = "🧿🔥H5🔥🧿"
+
+proxy_names = [p["name"] for p in final_proxies if p.get("status") == "ok"]
+
+# ========================================================
+# ----------------- YAML CONFIG --------------------------
+# ========================================================
+
+config = {
+    "proxies": final_proxies,
+    "proxy-groups": [
+
+        {
+            "name": Select,
+            "type": "select",
+            "proxies": [Auto, Stable, Fallback, "DIRECT"] + proxy_names
+        },
+
+        # ---------- CORE GROUPS ----------
+        {
+            "name": Auto,
+            "type": "url-test",
+            "url": "http://clients3.google.com/generate_204",
+            "interval": 5,
+            "timeout": 2,
+            "tolerance": 50,
+            "proxies": proxy_names
+        },
+        {
+            "name": Stable,
+            "type": "fallback",
+            "url": "https://www.cloudflare.com/cdn-cgi/trace",
+            "interval": 10,
+            "timeout": 3,
+            "tolerance": 120,
+            "proxies": proxy_names
+        },
+        {
+            "name": Fallback,
+            "type": "fallback",
+            "url": "http://www.msftconnecttest.com/connecttest.txt",
+            "interval": 30,
+            "timeout": 5,
+            "tolerance": 300,
+            "proxies": proxy_names
+        },
+
+        # ---------- G GROUPS ----------
+        {
+            "name": T1,
+            "type": "url-test",
+            "url": "https://cp.cloudflare.com/",
+            "interval": 15,
+            "timeout": 3,
+            "tolerance": 80,
+            "proxies": proxy_names
+        },
+        {
+            "name": T2,
+            "type": "fallback",
+            "url": "http://clients4.google.com/generate_204",
+            "interval": 20,
+            "timeout": 4,
+            "tolerance": 120,
+            "proxies": proxy_names
+        },
+        {
+            "name": T3,
+            "type": "fallback",
+            "url": "http://detectportal.firefox.com/success.txt",
+            "interval": 25,
+            "timeout": 4,
+            "tolerance": 150,
+            "proxies": proxy_names
+        },
+
+        # ---------- H GROUPS ----------
+        {
+            "name": T5,
+            "type": "fallback",
+            "url": "http://www.apple.com/library/test/success.html",
+            "interval": 2785,
+            "timeout": 14,
+            "tolerance": 150,
+            "proxies": proxy_names
+        },
+        {
+            "name": T6,
+            "type": "url-test",
+            "url": "http://1.1.1.1/cdn-cgi/trace",
+            "interval": 20,
+            "timeout": 3,
+            "tolerance": 100,
+            "proxies": build_group("Auto")
+        },
+        {
+            "name": T7,
+            "type": "fallback",
+            "url": "https://dns.google/resolve?name=example.com",
+            "interval": 30,
+            "timeout": 4,
+            "tolerance": 150,
+            "proxies": build_group("Stable")
+        },
+        {
+            "name": T8,
+            "type": "fallback",
+            "url": "http://clients5.google.com/generate_204",
+            "interval": 485,
+            "timeout": 16,
+            "tolerance": 2800,
+            "proxies": build_group("Fallback")
+        },
+        {
+            "name": T9,
+            "type": "url-test",
+            "url": "https://www.google.com/favicon.ico",
+            "interval": 6980,
+            "timeout": 234,
+            "tolerance": 380,
+            "proxies": build_group("T1")
+        },
+        {
+            "name": T10,
+            "type": "fallback",
+            "url": "http://clients6.google.com/generate_204",
+            "interval": 890,
+            "timeout": 36,
+            "tolerance": 2560,
+            "proxies": build_group("T2")
+        },
+        {
+            "name": T20,
+            "type": "fallback",
+            "url": "https://www.cloudflare.com/cdn-cgi/trace",
+            "interval": 1720,
+            "timeout": 6,
+            "tolerance": 45300,
+            "proxies": build_group("T3")
+        }
+    ],
+    "rules": [f"MATCH,{Select}"]
+}
+
+with open(OUT_PATH, "w", encoding="utf-8") as f:
+    yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
+
+print(f"[✅] YAML saved → {OUT_PATH}")
+
+
+# ================== SMART SWITCH (SAFE) ==================
+good_sorted = sorted(alive, key=lambda x: x.get("ping", 99999))
+
+if not good_sorted:
+    print("[!] No healthy proxies for smart switch")
+else:
+    stable_proxies = good_sorted[:min(10, len(good_sorted))]
+    ping_history = {p["name"]: deque(maxlen=30) for p in stable_proxies}
+
+    def smart_auto_switch():
+        active = stable_proxies[0]
+        while True:
+            best = active
+            for p in stable_proxies:
+                ping = tcp_ping_ms(p["server"], p["port"], timeout=1)
+                if ping is not None:
+                    ping_history[p["name"]].append(ping)
+
+                avg = (
+                    sum(ping_history[p["name"]]) / len(ping_history[p["name"]])
+                    if ping_history[p["name"]] else 9999
+                )
+                best_avg = (
+                    sum(ping_history[best["name"]]) / len(ping_history[best["name"]])
+                    if ping_history[best["name"]] else 9999
+                )
+
+                if avg < best_avg:
+                    best = p
+
+            if best["name"] != active["name"]:
+                active = best
+                print(f"[⚡] Switch → {active['name']}")
+
+            order = [p["name"] for p in stable_proxies if p["name"] != active["name"]]
+            order.insert(0, active["name"])
+
+            for g in config["proxy-groups"]:
+                if g["name"] in (Fallback, Stable):
+                    g["proxies"] = order
+
+            with open(OUT_PATH, "w", encoding="utf-8") as f:
+                yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
+
+            time.sleep(5)
+
+    threading.Thread(target=smart_auto_switch, daemon=True).start()
+
+

@@ -1,0 +1,290 @@
+#!/data/data/com.termux/files/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+"""
+Clash Meta Industrial Proxy Builder
+Ultra Stable – Ultra Fast – Fully Standard
+"""
+
+#==========================================================
+# IMPORTS
+#==========================================================
+import os, re, socket, time, base64, json, threading, subprocess
+from urllib.parse import urlparse, parse_qs, unquote
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+import yaml
+
+#==========================================================
+# PATHS
+#==========================================================
+
+# ---------------- paths & editor ----------------
+BASE_DIR = "/storage/emulated/0/Download/Akbar98"
+os.makedirs(BASE_DIR, exist_ok=True)
+INPUT_PATH = os.path.join(BASE_DIR, "input.txt")
+
+with open(INPUT_PATH, "w", encoding="utf-8") as f:
+    f.write("")
+subprocess.call(["nano", INPUT_PATH])
+
+out_folder = input("Enter output folder name in Download: ").strip()
+if not out_folder:
+    print("Folder name required."); exit(1)
+OUT_DIR = os.path.join("/storage/emulated/0/Download", out_folder)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+out_name = input("Enter output file name (without extension): ").strip()
+if not out_name:
+    print("File name required."); exit(1)
+OUT_PATH = os.path.join(OUT_DIR, f"{out_name}.yaml")
+
+
+#==========================================================
+# CONSTANTS
+#==========================================================
+PING_TIMEOUT = 1.0
+PING_WORKERS = 40
+MAX_HISTORY = 20
+FAIL_PENALTY = 300
+MIN_STABLE_SCORE = 0.7
+SWITCH_THRESHOLD = 0.15
+
+#==========================================================
+# UTILS
+#==========================================================
+def b64fix(s):
+    return s + "=" * (-len(s) % 4)
+
+def safe_int(x, d=0):
+    try: return int(x)
+    except: return d
+
+def sanitize(s):
+    return re.sub(r"[\r\n]+", "", str(s)).strip()
+
+_used_names = set()
+def uniq_name(base):
+    base = sanitize(base)
+    name = base
+    i = 1
+    while name in _used_names:
+        name = f"{base}-{i}"
+        i += 1
+    _used_names.add(name)
+    return name
+
+def split_host_port(s):
+    if ":" in s:
+        h, p = s.rsplit(":", 1)
+        return h, safe_int(p)
+    return s, None
+
+#==========================================================
+# TCP PING
+#==========================================================
+def tcp_ping(host, port, timeout=PING_TIMEOUT):
+    try:
+        s = socket.socket()
+        s.settimeout(timeout)
+        t0 = time.time()
+        s.connect((host, port))
+        s.close()
+        return int((time.time() - t0) * 1000)
+    except:
+        return None
+
+# ==========================================================
+# PARSERS
+# ==========================================================
+def parse_vless(s):
+    try:
+        u = urlparse(s)
+        q = parse_qs(u.query)
+        p = {
+            "name": uniq_name(unquote(u.fragment) or f"vless-{u.hostname}"),
+            "type": "vless",
+            "server": u.hostname,
+            "port": u.port or 443,
+            "uuid": u.username,
+            "encryption": "none",
+            "network": q.get("type", ["tcp"])[0],
+            "udp": True
+        }
+        if q.get("security", [""])[0] in ("tls", "reality"):
+            p["tls"] = True
+            p["servername"] = q.get("sni", [u.hostname])[0]
+        if p["network"] == "ws":
+            p["ws-opts"] = {
+                "path": q.get("path", ["/"])[0],
+                "headers": {"Host": q.get("host", [u.hostname])[0]}
+            }
+        return p
+    except:
+        return None
+
+def parse_vmess(s):
+    try:
+        raw = base64.b64decode(b64fix(s[8:])).decode()
+        j = json.loads(raw)
+        p = {
+            "name": uniq_name(j.get("ps") or f"vmess-{j['add']}"),
+            "type": "vmess",
+            "server": j["add"],
+            "port": safe_int(j["port"]),
+            "uuid": j["id"],
+            "alterId": safe_int(j.get("aid", 0)),
+            "cipher": j.get("scy", "auto"),
+            "network": j.get("net", "tcp"),
+            "udp": True
+        }
+        if j.get("tls") == "tls":
+            p["tls"] = True
+            p["servername"] = j.get("sni") or j["add"]
+        if p["network"] == "ws":
+            p["ws-opts"] = {
+                "path": j.get("path", "/"),
+                "headers": {"Host": j.get("host", j["add"])}
+            }
+        return p
+    except:
+        return None
+
+def parse_trojan(s):
+    try:
+        u = urlparse(s)
+        q = parse_qs(u.query)
+        return {
+            "name": uniq_name(unquote(u.fragment) or f"trojan-{u.hostname}"),
+            "type": "trojan",
+            "server": u.hostname,
+            "port": u.port or 443,
+            "password": u.username,
+            "tls": True,
+            "sni": q.get("sni", [u.hostname])[0],
+            "udp": True
+        }
+    except:
+        return None
+
+def parse_ss(s):
+    try:
+        raw = s[5:]
+        if "@" not in raw:
+            raw = base64.urlsafe_b64decode(b64fix(raw)).decode()
+        creds, hostp = raw.split("@", 1)
+        method, password = creds.split(":", 1)
+        host, port = split_host_port(hostp.split("#")[0])
+        return {
+            "name": uniq_name(f"ss-{host}"),
+            "type": "ss",
+            "server": host,
+            "port": port,
+            "cipher": method,
+            "password": password,
+            "udp": True
+        }
+    except:
+        return None
+
+def parse_ssr(s):
+    try:
+        raw = base64.urlsafe_b64decode(b64fix(s[6:])).decode()
+        parts = raw.split(":")
+        host, port, proto, method, obfs, pwd = parts[:6]
+        password = base64.urlsafe_b64decode(b64fix(pwd)).decode()
+        return {
+            "name": uniq_name(f"ssr-{host}"),
+            "type": "ssr",
+            "server": host,
+            "port": safe_int(port),
+            "protocol": proto,
+            "cipher": method,
+            "obfs": obfs,
+            "password": password
+        }
+    except:
+        return None
+
+def parse_line(s):
+    s = sanitize(s)
+    if s.startswith("vless://"): return parse_vless(s)
+    if s.startswith("vmess://"): return parse_vmess(s)
+    if s.startswith("trojan://"): return parse_trojan(s)
+    if s.startswith("ss://"): return parse_ss(s)
+    if s.startswith("ssr://"): return parse_ssr(s)
+    return None
+    
+    # ==========================================================
+# LOAD INPUT
+# ==========================================================
+open(INPUT_PATH, "w").close()
+subprocess.call(["nano", INPUT_PATH])
+lines = open(INPUT_PATH, encoding="utf-8").read().splitlines()
+
+proxies = [p for l in lines if (p := parse_line(l))]
+
+
+# ==========================================================
+# PING CHECK
+# ==========================================================
+def attach_ping(p):
+    p["ping"] = tcp_ping(p["server"], p["port"])
+    p["status"] = "ok" if p["ping"] else "dead"
+    return p
+
+with ThreadPoolExecutor(max_workers=PING_WORKERS) as ex:
+    proxies = list(ex.map(attach_ping, proxies))
+
+alive = [p for p in proxies if p["status"] == "ok"]
+alive.sort(key=lambda x: x["ping"])
+
+# ==========================================================
+# GROUPS
+# ==========================================================
+names = [p["name"] for p in proxies]
+
+config = {
+    "proxies": proxies,
+    "proxy-groups": [
+        {
+            "name": "🪀GLOBAL",
+            "type": "select",
+            "proxies": ["💛AUTO", "❤STABLE", "💙FALLBACK", "DIRECT"] + names
+        },
+        {
+            "name": "💛AUTO",
+            "type": "url-test",
+            "url": "http://cp.cloudflare.com/generate_204",
+            "interval": 3,
+            "tolerance": 50,
+            "proxies": [p["name"] for p in alive[:30]]
+        },
+        {
+            "name": "❤STABLE",
+            "type": "fallback",
+            "url": "http://cp.cloudflare.com/generate_204",
+            "interval": 1,
+            "proxies": [p["name"] for p in alive[:20]]
+        },
+        {
+            "name": "💙FALLBACK",
+            "type": "fallback",
+            "url": "http://cp.cloudflare.com/generate_204",
+            "interval": 10,
+            "proxies": names
+        }
+    ],
+    "rules": ["MATCH,🪀GLOBAL"]
+}
+
+# ==========================================================
+# SAVE YAML
+# ==========================================================
+with open(OUT_PATH, "w", encoding="utf-8") as f:
+    yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
+
+open(INPUT_PATH, "w").close()
+print("✅ DONE →", OUT_PATH)
+
+

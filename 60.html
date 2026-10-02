@@ -1,0 +1,480 @@
+#!/data/data/com.termux/files/usr/bin/python3
+# -*- coding: utf-8 -*-
+import os, re, json, socket, time, subprocess, base64, yaml, threading
+from urllib.parse import urlparse, parse_qs, unquote
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+
+# ---------------- paths & editor ----------------
+BASE_DIR = "/storage/emulated/0/Download/Akbar98"
+os.makedirs(BASE_DIR, exist_ok=True)
+INPUT_PATH = os.path.join(BASE_DIR, "input.txt")
+
+# ایجاد فایل ورودی و باز کردن در نانو
+with open(INPUT_PATH, "w", encoding="utf-8") as f:
+    f.write("")
+subprocess.call(["nano", INPUT_PATH])
+
+out_folder = input("Enter output folder name in Download: ").strip()
+if not out_folder:
+    print("Folder name required."); exit(1)
+OUT_DIR = os.path.join("/storage/emulated/0/Download", out_folder)
+os.makedirs(OUT_DIR, exist_ok=True)
+
+out_name = input("Enter output file name (without extension): ").strip()
+if not out_name:
+    print("File name required."); exit(1)
+OUT_PATH = os.path.join(OUT_DIR, f"{out_name}.yaml")
+
+# =================== HELPERS ===================
+def b64fix(s):
+    s = s.replace("-", "+").replace("_", "/")
+    return s + "=" * (-len(s) % 4)
+
+def safe_int(x, default=0):
+    try:
+        return int(x)
+    except:
+        return default
+
+def sanitize(s):
+    return re.sub(r'[\n\r]+', '', str(s).strip())
+
+_used_names = set()
+def uniq_name(base):
+    name = base
+    i = 1
+    while name in _used_names:
+        name = f"{base}-{i}"
+        i += 1
+    _used_names.add(name)
+    return name
+
+def tail(s, n=6):
+    return s[-n:] if len(s) > n else s
+
+def split_host_port(hostport: str):
+    if ':' in hostport:
+        host, port = hostport.split(":", 1)
+        return host.strip(), safe_int(port)
+    return hostport.strip(), None
+
+# ---------------- TCP ping ----------------
+def tcp_ping_once(host, port, timeout=0.2):
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        start = time.time()
+        sock.connect((host, port))
+        sock.close()
+        return int((time.time() - start) * 1000)
+    except:
+        return None
+
+def tcp_ping_median(host, port, attempts=7):
+    pings = []
+    for _ in range(attempts):
+        p = tcp_ping_once(host, port)
+        if p is not None: pings.append(p)
+    if pings:
+        pings.sort()
+        mid = len(pings) // 2
+        return pings[mid] if len(pings) % 2 else (pings[mid-1]+pings[mid])//2
+    return None
+
+def tcp_ping_ms(host, port, timeout=0.2):
+    try:
+        start = time.monotonic()
+        sock = socket.create_connection((host, int(port)), timeout=timeout)
+        sock.close()
+        return int((time.monotonic() - start) * 1000)
+    except Exception:
+        return None
+
+def attach_ping(proxy):
+    proxy['ping'] = tcp_ping_median(proxy['server'], proxy['port'])
+    proxy['status'] = "ok" if proxy['ping'] is not None else "fail"
+    return proxy
+
+# ---------------- JSON extraction ----------------
+def extract_json_objects(text):
+    objs, stack, start = [], [], None
+    for i, c in enumerate(text):
+        if c == '{':
+            if not stack: start = i
+            stack.append(c)
+        elif c == '}':
+            if stack:
+                stack.pop()
+                if not stack and start is not None:
+                    objs.append(text[start:i+1])
+                    start = None
+    return objs
+
+# ---------------- read input ----------------
+try:
+    with open(INPUT_PATH, "r", encoding="utf-8") as f:
+        content = f.read()
+except Exception:
+    content = ""
+
+proxies = []
+
+# ---------------- parse JSON fragments ----------------
+for frag in extract_json_objects(content):
+    try:
+        obj = json.loads(frag)
+    except Exception:
+        continue
+    outbounds = obj.get("outbounds", []) or []
+    for ob in outbounds:
+        proto = (ob.get("protocol") or "").lower()
+        if proto not in ("vless","vmess","trojan","shadowsocks","hysteria"):
+            continue
+        stream = ob.get("streamSettings") or {}
+        net = (stream.get("network") or "tcp").lower()
+        security = (stream.get("security") or "").lower()
+        tls_flag = security in ("tls","reality")
+
+        if proto in ("vless","vmess"):
+            try:
+                vnext = (ob.get("settings") or {}).get("vnext", [])[0]
+                user = (vnext.get("users") or [])[0]
+            except Exception:
+                continue
+            server = vnext.get("address") or ""
+            port = safe_int(vnext.get("port"), 0)
+            uid = user.get("id") or ""
+            if not (server and port and uid):
+                continue
+            base = f"{proto}-{server}-{tail(uid)}"
+            name = uniq_name(base)
+            p = {"name": name, "type": proto, "server": server, "port": port, "udp": True, "network": net}
+            if proto == "vless":
+                p["uuid"] = uid; p["encryption"] = "none"
+            else:
+                p["uuid"] = uid; p["alterId"] = safe_int(user.get("alterId", user.get("aid",0)))
+                p["cipher"] = user.get("cipher", "auto") or ob.get("settings", {}).get("clients", [{}])[0].get("cipher","auto")
+            if tls_flag:
+                sni = (stream.get("tlsSettings") or {}).get("serverName") or (stream.get("realitySettings") or {}).get("serverName") or server
+                p["tls"] = True; p["servername"] = sni
+            if net == "ws":
+                ws = stream.get("wsSettings") or {}
+                path = ws.get("path") or "/"
+                headers = ws.get("headers") or {}
+                p["ws-opts"] = {"path": path}
+                if headers: p["ws-opts"]["headers"] = headers
+            if net == "grpc":
+                grpc = stream.get("grpcSettings") or {}
+                svc = grpc.get("serviceName") or ""
+                p["grpc-opts"] = {"grpc-service-name": svc}
+            proxies.append(p)
+
+        elif proto == "trojan":
+            try:
+                s = (ob.get("settings") or {}).get("servers", [])[0]
+            except Exception:
+                continue
+            server = s.get("address") or ""
+            port = safe_int(s.get("port"), 0)
+            pwd = s.get("password") or ""
+            if not (server and port and pwd):
+                continue
+            name = uniq_name(f"trojan-{server}-{tail(pwd)}")
+            p = {"name": name, "type": "trojan", "server": server, "port": port, "password": pwd, "udp": True, "network": "tcp"}
+            if tls_flag:
+                p["tls"] = True; p["sni"] = server
+            proxies.append(p)
+
+        elif proto == "shadowsocks":
+            try:
+                s = (ob.get("settings") or {}).get("servers", [])[0]
+            except Exception:
+                continue
+            server = s.get("address") or ""
+            port = safe_int(s.get("port"), 0)
+            cipher = s.get("method") or s.get("cipher") or ""
+            password = s.get("password") or ""
+            if not (server and port and cipher and password):
+                continue
+            name = uniq_name(f"ss-{server}-{port}")
+            p = {"name": name, "type": "ss", "server": server, "port": port, "cipher": cipher, "password": password, "udp": True}
+            proxies.append(p)
+# ---------------- parse line links ----------------
+for line in [ln.strip() for ln in content.splitlines() if ln.strip() and not ln.strip().startswith("{")]:
+    try:
+        if line.startswith("vless://"):
+            parsed = urlparse(line)
+            uid = parsed.username or ""
+            host = parsed.hostname or ""
+            port = parsed.port or 443
+            q = parse_qs(parsed.query)
+            if not (uid and host and port):
+                continue
+            net = (q.get("type", ["tcp"])[0] or "tcp").lower()
+            tls_flag = (q.get("security", [""])[0] or "").lower() in ("tls","reality")
+            name = uniq_name(f"vless-{host}-{tail(uid)}")
+            p = {"name": name, "type": "vless", "server": host, "port": port, "uuid": uid, "encryption":"none","udp":True,"network":net}
+            if net == "ws":
+                p["ws-opts"] = {"path": q.get("path", ["/"])[0]}
+                hosth = q.get("host", []) or q.get("Host", [])
+                if hosth: p["ws-opts"]["headers"] = {"Host":hosth[0]}
+            elif net == "grpc":
+                svc = q.get("serviceName", [""])[0]
+                if svc: p["grpc-opts"] = {"grpc-service-name": svc}
+            if tls_flag:
+                sni = q.get("sni", []) or q.get("servername", []) or [host]
+                p["tls"] = True; p["servername"] = sni[0]
+            proxies.append(p)
+
+        elif line.startswith("vmess://"):
+            payload = line[8:]
+            try:
+                decoded = base64.b64decode(b64fix(payload)).decode(errors="ignore")
+                info = json.loads(decoded)
+            except Exception:
+                continue
+            host = info.get("add") or info.get("server") or ""
+            port = safe_int(info.get("port"), 0)
+            uid = info.get("id") or ""
+            if not (host and port and uid):
+                continue
+            net = (info.get("net") or "tcp").lower()
+            tls_flag = str(info.get("tls","")).lower() == "tls"
+            name = uniq_name(f"vmess-{host}-{tail(uid)}")
+            p = {"name": name, "type": "vmess", "server": host, "port": port, "uuid": uid,
+                 "alterId": safe_int(info.get("aid", info.get("alterId",0))),
+                 "cipher": info.get("scy","auto"), "udp": True, "network": net}
+            if net == "ws":
+                path = info.get("path") or "/"
+                hosth = info.get("host") or ""
+                p["ws-opts"] = {"path": path}
+                if hosth: p["ws-opts"]["headers"] = {"Host": hosth}
+            if tls_flag:
+                sni = info.get("sni") or info.get("host") or host
+                p["tls"] = True; p["servername"] = sni
+            proxies.append(p)
+
+        elif line.startswith("trojan://"):
+            parsed = urlparse(line)
+            pwd = parsed.username or ""
+            host = parsed.hostname or ""
+            port = parsed.port or 443
+            if not (pwd and host and port):
+                continue
+            q = parse_qs(parsed.query)
+            sni = q.get("sni", [host])[0]
+            name = uniq_name(f"trojan-{host}-{tail(pwd)}")
+            p = {"name": name, "type": "trojan", "server": host, "port": port, "password": pwd, "udp": True, "network":"tcp", "tls": True, "sni": sni}
+            proxies.append(p)
+
+        elif line.startswith("ss://"):
+            try:
+                after = line[5:]
+                if "@" in after and ":" in after.split("@",1)[0]:
+                    cred, rest = after.split("@",1)
+                    if ":" in cred:
+                        method, password = cred.split(":",1)
+                    else:
+                        continue
+                    host_port = rest.split("#",1)[0]
+                    if ":" not in host_port: continue
+                    host, port = host_port.rsplit(":",1)
+                else:
+                    if "@" not in after: continue
+                    b64cred, rest = after.split("@",1)
+                    method_password = base64.urlsafe_b64decode(b64fix(b64cred)).decode()
+                    method, password = method_password.split(":",1)
+                    host_port = rest.split("#",1)[0]
+                    host, port = host_port.rsplit(":",1)
+                method = method.strip(); password = password.strip(); host = host.strip(); port = safe_int(port.strip(),0)
+                if not (method and password and host and port):
+                    continue
+                name = uniq_name(f"ss-{host}-{port}")
+                p = {"name": name, "type":"ss", "server": host, "port": port, "cipher": method, "password": password, "udp": True}
+                proxies.append(p)
+            except Exception:
+                continue
+
+        elif line.startswith("hysteria://"):
+            parsed = urlparse(line)
+            passwd = parsed.password or ""
+            host = parsed.hostname or ""
+            port = parsed.port or 443
+            q = parse_qs(parsed.query)
+            protocol = q.get("protocol", ["udp"])[0]
+            obfs = q.get("obfs", ["none"])[0]
+            auth = q.get("auth", [""])[0]
+            if not (host and port and passwd):
+                continue
+            name = uniq_name(f"hysteria-{host}-{tail(passwd)}")
+            p = {"name": name, "type":"hysteria","server":host,"port":port,"password":passwd,"protocol":protocol,"obfs":obfs,"auth":auth,"udp":True}
+            proxies.append(p)
+
+    except Exception:
+        continue
+
+# ---------------- dedupe proxies ----------------
+def dedupe_proxies(proxies):
+    seen=set()
+    result=[]
+    for p in proxies:
+        key=(p.get("type"), p.get("server"), p.get("port"), p.get("name"))
+        if key not in seen:
+            seen.add(key)
+            result.append(p)
+    return result
+
+final_proxies = dedupe_proxies(proxies)
+
+# ---------------- convert to Clash Meta ----------------
+def to_clash_meta(proxy):
+    mapping={"vless":"vless","vmess":"vmess","trojan":"trojan","ss":"ss","hysteria":"hysteria"}
+    t=mapping.get(proxy.get("type"))
+    if not t: return None
+    meta={"name":proxy.get("name"),"type":t,"server":proxy.get("server"),"port":proxy.get("port")}
+    if t=="vless":
+        meta.update({k:proxy[k] for k in ["uuid","tls","network","ws-opts","grpc-opts"] if k in proxy})
+    elif t=="vmess":
+        meta.update({k:proxy[k] for k in ["uuid","alterId","cipher","tls","network","ws-opts","grpc-opts"] if k in proxy})
+    elif t=="trojan":
+        meta.update({k:proxy[k] for k in ["password","tls","network","ws-opts","grpc-opts"] if k in proxy})
+    elif t=="ss":
+        meta.update({k:proxy[k] for k in ["cipher","password","udp"] if k in proxy})
+    elif t=="hysteria":
+        meta.update({k:proxy[k] for k in ["auth","protocol","obfs","tls","udp"] if k in proxy})
+    return meta
+
+clash_proxies = [to_clash_meta(p) for p in final_proxies if to_clash_meta(p)]
+
+# ---------------- Attach TCP ping -----------------
+def check_and_attach_ping(proxy):
+    host = proxy.get("server") or ""
+    port = proxy.get("port") or 0
+    if not host or not port:
+        proxy["ping"] = None
+        proxy["status"] = "dead"
+        return proxy
+    lat = tcp_ping_ms(host, port, timeout=0.2)
+    if lat is None:
+        proxy["ping"] = None
+        proxy["status"] = "dead"
+    else:
+        proxy["ping"] = lat
+        proxy["status"] = "ok"
+    return proxy
+
+results = []
+if clash_proxies:
+    max_workers = min(40, len(clash_proxies))
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(check_and_attach_ping, p): idx for idx,p in enumerate(clash_proxies)}
+        for fut in as_completed(futs):
+            try:
+                res = fut.result()
+                results.append(res)
+            except Exception:
+                pass
+
+name_map = {p["name"]: p for p in results} if results else {p["name"]: p for p in clash_proxies}
+final_proxies = [name_map.get(p["name"], p) for p in clash_proxies]
+
+good = [p for p in final_proxies if p.get("status")=="ok"]
+good_sorted = sorted(good, key=lambda x: x.get("ping", 9999))
+proxy_names = [p["name"] for p in final_proxies]
+
+
+# ----------------- final config with fallback group -----------------
+good_proxies = [p for p in final_proxies if p.get("status") == "ok"]
+good_sorted = sorted(good_proxies, key=lambda x: x.get("ping", 99999))
+
+config = {
+    "proxies": final_proxies,
+    "proxy-groups": [
+        {
+            "name": "🔰 Fastest AutoSwitch",
+            "type": "url-test",
+            "proxies": [p["name"] for p in good_sorted[:3]],  # نمونه سریع‌ترین‌ها
+            "url": "http://cp.cloudflare.com/generate_204",
+            "interval": 3
+        },
+{
+            "name": "🟠🟣🔴ALMASI🔴🟣🟠",
+            "type": "url-test",
+            "proxies": [p["name"] for p in good_sorted[:3]],  # نمونه سریع‌ترین‌ها
+            "url": "http://cp.cloudflare.com/generate_204",
+            "interval": 2
+        },
+{
+            "name": "📌🔵🌟 JAVED_SHAH🌟🔵📌",
+            "type": "url-test",
+            "proxies": [p["name"] for p in good_sorted[:3]],  # نمونه سریع‌ترین‌ها
+            "url": "http://cp.cloudflare.com/generate_204",
+            "interval": 1
+        },
+        {
+            "name": "⚡ All Proxies",
+            "type": "select",
+            "proxies": [p["name"] for p in good_sorted]
+        },
+        {
+            "name": "♻ Fallback Stable",
+            "type": "fallback",
+            "proxies": [p["name"] for p in good_sorted],
+            "url": "http://cp.cloudflare.com/generate_204",
+            "interval": 5
+        }
+    ]
+}
+
+with open(OUT_PATH, "w", encoding="utf-8") as f:
+    yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
+
+print(f"[✅] Saved {len(final_proxies)} proxies to {OUT_PATH}")
+MIN_PROXIES = min(12, len(good_sorted))
+stable_proxies = good_sorted[:MIN_PROXIES]
+
+ping_history = {p['name']: deque(maxlen=5) for p in stable_proxies}
+stability_score = {p['name']: 0 for p in stable_proxies}
+
+def smart_auto_switch_advanced():
+    active = stable_proxies[0]
+    while True:
+        best = active
+        for p in stable_proxies:
+            ping = tcp_ping_ms(p['server'], p['port'], timeout=1)
+            if ping is not None:
+                ping_history[p['name']].append(ping)
+                avg_ping = sum(ping_history[p['name']]) / len(ping_history[p['name']])
+                stability_score[p['name']] = stability_score.get(p['name'], 0) + 1
+            else:
+                avg_ping = float('inf')
+                stability_score[p['name']] = 0
+
+            best_avg = (sum(ping_history[best['name']]) / len(ping_history[best['name']])) if ping_history[best['name']] else float('inf')
+            if stability_score[p['name']] > 0 and avg_ping < best_avg:
+                best = p
+
+        if best['name'] != active['name']:
+            active = best
+            print(f"[⚡] Switched to better proxy: {active['name']} (avg_ping={sum(ping_history[active['name']])/len(ping_history[active['name']]):.1f}ms)")
+
+        fallback_group = [p['name'] for p in stable_proxies if p['name'] != active['name']]
+        fallback_group.insert(0, active['name'])
+        for group in config['proxy-groups']:
+            if "fallback" in group['name'].lower():
+                group['proxies'] = fallback_group
+
+        with open(OUT_PATH, "w", encoding="utf-8") as f:
+            yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False)
+
+        active_avg_ping = sum(ping_history[active['name']]) / len(ping_history[active['name']]) if ping_history[active['name']] else 1000
+        sleep_time = 5 if active_avg_ping < 50 else 3
+        time.sleep(sleep_time)
+
+threading.Thread(target=smart_auto_switch_advanced, daemon=True).start()
+
+
+ 
+
+
